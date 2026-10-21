@@ -1,0 +1,10 @@
+[server]
+headless = true
+maxUploadSize = 2048  # MB
+# Hugging Face serves the app inside an iframe where Streamlit's XSRF cookie is blocked,
+# which makes file uploads fail with 403. The app is protected by an access code instead.
+enableXsrfProtection = false
+enableCORS = false
+
+[browser]
+gatherUsageStats = false

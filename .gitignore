@@ -1,0 +1,26 @@
+# Confidential data — never commit or deploy
+class recordings*/
+*.mp4
+*.mov
+*.mkv
+*.webm
+*.vtt
+*.pdf
+redact_names.txt
+eval/labels.json
+eval/runs/
+logs/
+
+# Secrets
+.env
+.streamlit/secrets.toml
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+.pytest_cache/
+
+# OS / editor
+.DS_Store
+.vscode/

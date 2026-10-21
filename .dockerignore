@@ -1,0 +1,29 @@
+# Confidential data must never be baked into the image
+class recordings*
+*.mp4
+*.mov
+*.mkv
+*.webm
+*.mp3
+*.m4a
+*.wav
+*.vtt
+*.srt
+*.pdf
+redact_names.txt
+eval/
+logs/
+
+# Secrets
+.env
+.streamlit/secrets.toml
+
+# Not needed at runtime
+.git
+.venv
+__pycache__
+.pytest_cache
+tests/
+docs/
+ai-logs/
+scripts/
