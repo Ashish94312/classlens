@@ -72,3 +72,11 @@ Assistant: Claude Code (Claude Opus 5.5). Entries are newest last.
 | Upload to HF from a `git archive` export, not the working folder | Guarantees only tracked files leave the machine; the working folder also holds the recordings |
 | Audio files with cover art: ignore `attached_pic` video streams | Otherwise an `.mp3` would be treated as video |
 | `anthropic` SDK is 2.0.0 (newer than the reference docs) | Check its API before writing the LLM code in Phase 2 |
+
+### Follow-up — hosting changed to Streamlit Community Cloud
+
+**Prompt (summary):** Can we use something other than Hugging Face, e.g. Streamlit hosting or Firebase? Keep everything private; it becomes public only when the user says. The GitHub repo will need to be public at submission so evaluators can run it.
+
+**Finding:** Creating the Space failed: Hugging Face now requires a PRO subscription to host Docker/Gradio Spaces on free CPU, and the account is not PRO. Firebase was checked at the user's request: its free plan serves static files only; Python needs the Blaze plan with Cloud Run underneath, whose 32 MiB HTTP/1 request limit blocks direct uploads of 54–340 MB recordings.
+
+**Decision:** Host on Streamlit Community Cloud (free, no card, private viewers while building). Added `packages.txt` (ffmpeg); re-enabled Streamlit's XSRF protection (it was only disabled for the HF iframe); removed the HF config block from the README. To fit ~2.7 GB RAM, Mode B will transcribe sampled windows (~25 min) instead of the full audio; the Drive-link input is the fallback if large uploads fail. The Dockerfile stays for portability. GitHub repo and app go public only on the user's instruction, after a pre-publish check of the full git history.

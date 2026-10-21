@@ -4,7 +4,8 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends ffmpeg \
     && rm -rf /var/lib/apt/lists/*
 
-# Hugging Face Spaces run containers as uid 1000
+# Portable container build (the hosted app runs on Streamlit Community Cloud; see HLD §11).
+# Non-root user, uid 1000, as most container hosts expect.
 RUN useradd -m -u 1000 user
 USER user
 ENV HOME=/home/user PATH=/home/user/.local/bin:$PATH

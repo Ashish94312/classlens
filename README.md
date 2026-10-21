@@ -1,13 +1,3 @@
----
-title: ClassLens
-emoji: ♟️
-colorFrom: indigo
-colorTo: green
-sdk: docker
-app_port: 7860
-pinned: false
----
-
 # ClassLens
 
 Assesses the quality of a recorded online class and grades it **Poor / Average / Good / Excellent**, with specific, timestamped observations.
@@ -30,6 +20,18 @@ Optional environment variables:
 |---|---|
 | `APP_ACCESS_CODE` | Access code required to use the app (unset = no gate, for local development) |
 | `ANTHROPIC_API_KEY` | Claude API key (unset = local-only mode) |
+
+## Deploy (Streamlit Community Cloud)
+
+1. At [share.streamlit.io](https://share.streamlit.io), create an app from this repo, branch `main`, main file `app.py`.
+2. Advanced settings: Python 3.11; Secrets:
+   ```toml
+   APP_ACCESS_CODE = "choose-a-code"
+   ANTHROPIC_API_KEY = "sk-ant-..."
+   ```
+3. `packages.txt` installs `ffmpeg`; `requirements.txt` installs the Python packages.
+
+A `Dockerfile` is included for running the same app on any container host.
 
 ## Tests
 

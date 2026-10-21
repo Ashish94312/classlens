@@ -15,7 +15,7 @@ Status: design v1 · 2026-10-22 · implementation follows this document; deviati
 | Explain with specific observations, not generic statements | Every observation carries a timestamp + quote or a measured number; ungrounded LLM claims are dropped by a validator |
 | Genuinely process an unseen recording | Full pipeline runs on the input: transcript, audio, video frames, LLM judgement |
 | Keep recordings confidential | Video and audio never leave the server; only pseudonymised transcript text + numeric facts reach the LLM API |
-| Hosted link, README, AI interaction history, ≤300-word note | Hugging Face Space, GitHub repo, `ai-logs/` with redacted sessions |
+| Hosted link, README, AI interaction history, ≤300-word note | Streamlit Community Cloud app, GitHub repo, `ai-logs/` with redacted sessions |
 
 Evaluation weights to optimise for: assessment quality 35%, problem-solving and use of AI 30%, working app and code quality 25%, clarity 10%.
 
@@ -88,7 +88,7 @@ flowchart LR
   subgraph Browser
     U[Reviewer]
   end
-  subgraph Server["App server (Hugging Face Space) — raw media never leaves"]
+  subgraph Server["App server (Streamlit Community Cloud) — raw media never leaves"]
     UI[Streamlit UI<br/>access code gate]
     ING[Ingest<br/>validate · temp dir · ffprobe]
     TR[Transcript<br/>VTT parse / local Whisper fallback]
@@ -310,7 +310,7 @@ Principle: **data minimisation**. Each service receives the least identifying fo
 
 ### 8.1 Who sees what
 
-| Data | App server (HF Space) | Claude API | GitHub / Space repo | AI assistant during development |
+| Data | App server (Streamlit Cloud) | Claude API | GitHub repo | AI assistant during development |
 |---|---|---|---|---|
 | Video, frames | Processed in memory; temp file deleted after run | Never | Never | Never (from session 02 on) |
 | Audio | Processed on server (features, local Whisper); deleted after run | Never | Never | Never |
@@ -335,7 +335,7 @@ Children are identifiable three ways: **face**, **voice** and **name**. Face and
 - Ephemeral processing: everything lives in a `tempfile.TemporaryDirectory()` that is removed when the run ends, success or failure. Frames are piped from `ffmpeg` straight into NumPy; no image files are written.
 - No storage: no database, no caching of media, no video or frames shown back in the UI. The report uses `T` / `S1..Sn`.
 - Logs hold metadata only (run-id hash, prompt version, tokens, latency, flags).
-- The Space repo contains code only. Keys live in Space secrets.
+- The repo the app deploys from contains code only. Keys live in the platform's secrets settings.
 - A short notice above the uploader states what is processed where and that files are deleted after analysis.
 
 **R3 — permitted processing, children identifiable**
@@ -464,19 +464,26 @@ Deliberately **not** used: LangChain / agent frameworks (one structured call doe
 
 ## 11. Deployment
 
-**Recommended: Hugging Face Spaces, Docker SDK, free CPU tier** (2 vCPU, 16 GB RAM, ephemeral disk).
+**Chosen: Streamlit Community Cloud** (free, no card; up to ~2 cores and ~2.7 GB RAM; deploys from the GitHub repo).
 
-- `Dockerfile`: `python:3.11-slim` + `apt-get install ffmpeg` + `pip install -r requirements.txt`; runs `streamlit run app.py --server.port 7860`.
-- `.streamlit/config.toml`: `maxUploadSize = 2048`; `enableXsrfProtection = false` (Streamlit uploads inside the HF iframe otherwise fail with 403 — validate in Phase 0).
-- Secrets: `ANTHROPIC_API_KEY`, `APP_ACCESS_CODE`.
-- Free Spaces sleep after inactivity → open the app shortly before the evaluation window.
+- `requirements.txt` for Python packages; `packages.txt` installs `ffmpeg` via apt. Python 3.11 is selected in the app's advanced settings.
+- `.streamlit/config.toml`: `maxUploadSize = 2048`. XSRF protection stays on (default).
+- Secrets (app settings → Secrets, TOML): `APP_ACCESS_CODE`, `ANTHROPIC_API_KEY`. Root-level secrets are exposed as environment variables, so the code reads `os.environ`.
+- Limited CPU/RAM: Mode B transcribes only the opening and closing 10 minutes plus sampled middle windows (~25 min of audio instead of the whole class), and frames are seek-sampled rather than decoded in full.
+- If a 300 MB upload fails on the platform, the Google Drive link input (server-side download) is the fallback path.
+- Free apps sleep after inactivity → open the app shortly before the evaluation window.
+- Visibility: private (invited viewers only) while building; switched to public, behind the access code, at submission. Same for the GitHub repo.
+- The `Dockerfile` is kept so the app can move to any container host without code changes.
+
+Options considered (checked 2026-10-22):
 
 | Option | Verdict |
 |---|---|
-| HF Spaces (Docker) | ✅ Enough RAM for 300 MB videos + OpenCV; apt packages; secrets; free |
-| Streamlit Community Cloud | ⚠️ Tight memory for large videos; fine as backup for VTT-only mode |
-| Render / Railway free tiers | ❌ 512 MB RAM-class limits or sleeping/credit limits |
-| Google Cloud Run | ❌ Needs billing setup; more ops than the timebox allows |
+| Streamlit Community Cloud | ✅ Free, private-capable, runs Streamlit natively; tighter resources handled as above |
+| Hugging Face Spaces (Docker / Gradio) | ❌ Free CPU hosting for these Space types now requires a PRO subscription |
+| Firebase (Hosting / Functions / App Hosting) | ❌ Free plan hosts static files only; running Python needs the Blaze plan and Cloud Run underneath |
+| Google Cloud Run | ❌ Needs billing; 32 MiB HTTP/1 request limit blocks direct uploads of recordings |
+| Render / Koyeb free tiers | ❌ ~512 MB RAM, too small for 300 MB videos |
 
 GitHub repo holds code only; recordings, feedback PDF and labels are in `.gitignore`.
 
@@ -586,7 +593,7 @@ README.md
 
 | Phase | Time | Build | Done when |
 |---|---|---|---|
-| 0 Skeleton + deploy check | 30 min | Repo, `.gitignore`, config, Dockerfile, hello-world Space with upload + `ffprobe` | Hosted page accepts a 300 MB upload and prints its duration |
+| 0 Skeleton + deploy check | 30 min | Repo, `.gitignore`, config, Dockerfile, `packages.txt`, hello-world app on Streamlit Community Cloud with upload + `ffprobe` | Hosted page accepts a 300 MB upload and prints its duration |
 | 1 Transcript layer | 75 min | `transcript.py` (tolerant VTT/SRT parser, label merging, quality score, clip-boundary detection), `privacy.py`, `metrics.py`, tests | Metrics for all 12 recordings; no real names in the pseudonymised output; parser tests pass on malformed fixtures |
 | 2 LLM judge | 60 min | `prompts/judge_v1.md`, `judge.py`, validator, `ailog.py`, local-only fallback | Valid `Judgement` on 2 recordings; ≥ 90% evidence accepted; API failure falls back cleanly |
 | 3 Audio + video | 75 min | `audio.py`, `video.py`, logo template, transcript–video alignment, `asr.py` (Mode B) | Flags match reviewer notes for B482, B441, B392; 45 s offset detected; Mode B runs end to end |
@@ -609,7 +616,7 @@ Stretch, if time remains: parallel audio/video extraction; prompt v2 from evalua
 | Overfitting to 10 examples | Rubric comes from reviewer criteria; only cut-points are calibrated; leave-one-out reported |
 | Zoom gallery view instead of speaker view breaks teacher-frame mapping | Detect multi-tile layouts (many faces per frame) → skip C6 face checks, lower confidence |
 | Haar cascade misses angled or poorly lit faces | Use ratios over ~150 frames with tolerant thresholds; low light is itself reported |
-| HF Streamlit upload quirks | Validate in Phase 0; Gradio is the fallback UI |
+| Large uploads fail or the app runs out of memory on the free host | Validate in Phase 0 with a 300 MB file; Drive-link input as fallback; windowed Whisper; Dockerfile allows moving hosts |
 | Name slips past pseudonymisation | Payload guard (§8.2 R3) blocks the call; residual risk documented |
 
 Resolved:
