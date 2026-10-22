@@ -10,24 +10,31 @@ Upload a class video (mp4, mov, mkv or webm, up to 500 MB). On the server: speec
 
 A 44-minute class takes about 2.5 minutes on a laptop (Whisper about 2 min, Claude about 35 s) and about $0.15 in API calls. One analysis runs at a time; others wait their turn.
 
-## Run locally
+## Run locally (no credentials needed)
 
-Requires Python 3.11 and `ffmpeg`.
+Requires Python 3.11, `ffmpeg` (`brew install ffmpeg` on macOS, `sudo apt install ffmpeg` on Ubuntu) and an internet connection.
 
 ```bash
-python -m venv .venv
+git clone https://github.com/Ashish94312/classlens.git
+cd classlens
+python3.11 -m venv .venv
 .venv/bin/pip install -r requirements-dev.txt
 .venv/bin/streamlit run app.py
 ```
 
-No setup is needed for the evaluation: when no Claude key is configured, the app loads a **temporary evaluation key** from a link in `classlens/config.py` (`EVAL_KEY_URL`). That key has a spending limit and will be revoked after the evaluation. It is kept in memory only, never written to disk or logs. To use your own key instead, set `ANTHROPIC_API_KEY` in the environment or in a `.env` file (`cp .env.example .env`); a configured key always wins.
+Open the address it prints (usually http://localhost:8501), upload a class video and press **Analyse**. No API key, access code or `.env` file is needed:
 
-The first analysis downloads the Whisper model (about 150 MB) once.
+- **Claude key:** during the evaluation the app loads a temporary key automatically from a link in `classlens/config.py` (`EVAL_KEY_URL`). It is a separate key with a spending limit, kept in memory only (never written to disk or logs), and will be revoked after the evaluation.
+- **Access code:** only the hosted app asks for one; a local run opens directly.
+
+The first analysis also downloads the Whisper speech-to-text model (about 150 MB), once.
+
+**Using your own Claude key instead** (for example after the evaluation key is revoked): put it in a `.env` file (`cp .env.example .env`, then fill in `ANTHROPIC_API_KEY`) or export it in the terminal. A key you configure always takes precedence over the evaluation key.
 
 | Variable | Purpose |
 |---|---|
-| `ANTHROPIC_API_KEY` | Claude API key; optional while the evaluation key is live. Without any key the app stops after speech-to-text and says why |
-| `APP_ACCESS_CODE` | Access code required to use the app (unset = no gate, for local development) |
+| `ANTHROPIC_API_KEY` | Optional: your own Claude key. Without any key the app stops after speech-to-text and says why |
+| `APP_ACCESS_CODE` | Optional: require an access code (the hosted app sets one; unset = no gate) |
 
 ## Deploy (Streamlit Community Cloud)
 
