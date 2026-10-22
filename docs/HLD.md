@@ -340,6 +340,7 @@ Children are identifiable three ways: **face**, **voice** and **name**. Face and
 - No storage: no database, no caching of media, no video or frames shown back in the UI. The report uses `T` / `S` / `N1..Nn`.
 - Logs hold metadata only (run-id hash, prompt version, tokens, latency, flags).
 - The repo the app deploys from contains code only. Keys live in the platform's secrets settings.
+- **Temporary evaluation key (owner's decision, 2026-10-22):** so a fresh clone runs without setup, `config.EVAL_KEY_URL` points to a public file holding a separate Claude key with a spending limit, revoked after the evaluation. It is read only when no key is configured (environment, `.env` or Streamlit secrets always win), only `ANTHROPIC_API_KEY` is taken and only if it looks like a Claude key, and it stays in memory. The README says so. Recommended alternative, not chosen: give evaluators the key privately in the submission form.
 - A short notice above the uploader states what is processed where and that files are deleted after analysis.
 
 **R3 — permitted processing, children identifiable**
@@ -359,7 +360,9 @@ The AI assistant is also a service that sees whatever is pasted or printed into 
 
 ### 8.4 Residual risk
 
-Stated in the README: ASR-misspelled names inside the text (e.g. a name transcribed wrongly) can slip past the name guard. These would be first names only, with no faces, voices, surnames or contact details attached.
+Stated in the README: ASR-misspelled names inside the text (e.g. a name transcribed wrongly) can slip past the name guard. These would be first names only, with no faces, voices, surnames or contact details attached. Measured on the 12 sample classes: 8 of about 8,700 lines still held a first name (names speech-to-text never capitalises).
+
+The temporary evaluation key is public until revoked: anyone reading the repository can spend up to its limit. Mitigation: separate key, spending limit, revoked after the evaluation.
 
 ---
 

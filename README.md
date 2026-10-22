@@ -17,15 +17,16 @@ Requires Python 3.11 and `ffmpeg`.
 ```bash
 python -m venv .venv
 .venv/bin/pip install -r requirements-dev.txt
-cp .env.example .env      # then fill in ANTHROPIC_API_KEY
 .venv/bin/streamlit run app.py
 ```
+
+No setup is needed for the evaluation: when no Claude key is configured, the app loads a **temporary evaluation key** from a link in `classlens/config.py` (`EVAL_KEY_URL`). That key has a spending limit and will be revoked after the evaluation. It is kept in memory only, never written to disk or logs. To use your own key instead, set `ANTHROPIC_API_KEY` in the environment or in a `.env` file (`cp .env.example .env`); a configured key always wins.
 
 The first analysis downloads the Whisper model (about 150 MB) once.
 
 | Variable | Purpose |
 |---|---|
-| `ANTHROPIC_API_KEY` | Claude API key. Without it the app stops after speech-to-text and says why |
+| `ANTHROPIC_API_KEY` | Claude API key; optional while the evaluation key is live. Without any key the app stops after speech-to-text and says why |
 | `APP_ACCESS_CODE` | Access code required to use the app (unset = no gate, for local development) |
 
 ## Deploy (Streamlit Community Cloud)

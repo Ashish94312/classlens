@@ -1,6 +1,8 @@
 """Central settings. Tunable numbers live here, not in the logic."""
 
 import os
+import re
+import urllib.request
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -10,16 +12,57 @@ ENV_FILE = ROOT / ".env"
 ACCESS_CODE_ENV = "APP_ACCESS_CODE"
 API_KEY_ENV = "ANTHROPIC_API_KEY"
 
+# Temporary evaluation key (HLD §8): a file holding "ANTHROPIC_API_KEY=…", read only when no key is
+# configured, so a fresh clone runs without setup. Spend-limited and revoked after the evaluation.
+# "" turns it off.
+EVAL_KEY_URL = "https://drive.google.com/file/d/1GJ3hXKoOeKTioiXBG_yG_raYGAeGgTHq/view?usp=sharing"
+EVAL_KEY_TIMEOUT_S = 10
+# The file id in a Google Drive share link: ".../file/d/<id>/view?usp=sharing" or "...open?id=<id>"
+DRIVE_FILE_ID = re.compile(r"/d/([\w-]{20,})|[?&]id=([\w-]{20,})")
 
-def load_env_file(path: Path = ENV_FILE) -> None:
-    """Load KEY=VALUE lines from the git-ignored .env. Real environment variables take precedence."""
-    if not path.exists():
-        return
-    for line in path.read_text(encoding="utf-8").splitlines():
+
+def parse_env(text: str) -> dict[str, str]:
+    """KEY=VALUE lines → dict. Comments, blank lines and lines without "=" are skipped."""
+    values = {}
+    for line in text.splitlines():
         key, sep, value = line.partition("=")
         key = key.strip().removeprefix("export ").strip()
         if sep and key and not key.startswith("#"):
-            os.environ.setdefault(key, value.strip().strip("\"'"))
+            values[key] = value.strip().strip("\"'")
+    return values
+
+
+def load_env_file(path: Path = ENV_FILE) -> None:
+    """Load the git-ignored .env, then the evaluation key if no Claude key is set by then. Real
+    environment variables (and Streamlit secrets) always take precedence."""
+    if path.exists():
+        for key, value in parse_env(path.read_text(encoding="utf-8")).items():
+            os.environ.setdefault(key, value)
+    if not os.environ.get(API_KEY_ENV):
+        load_eval_key()
+
+
+def load_eval_key() -> None:
+    """Fetch the evaluation key into memory only (never to disk or logs). Only ANTHROPIC_API_KEY is
+    taken from the file, and only if it looks like a Claude key; any failure leaves no key set."""
+    if not EVAL_KEY_URL:
+        return
+    try:
+        with urllib.request.urlopen(direct_download_url(EVAL_KEY_URL), timeout=EVAL_KEY_TIMEOUT_S) as response:
+            text = response.read(4096).decode("utf-8", errors="replace")
+    except OSError:  # no network, timeout, link removed
+        return
+    key = parse_env(text).get(API_KEY_ENV, "")
+    if key.startswith("sk-ant-"):
+        os.environ[API_KEY_ENV] = key
+
+
+def direct_download_url(url: str) -> str:
+    """A Google Drive share link → its direct download link; any other link unchanged."""
+    match = DRIVE_FILE_ID.search(url)
+    if "drive.google.com" not in url or match is None:
+        return url
+    return f"https://drive.google.com/uc?export=download&id={match.group(1) or match.group(2)}"
 
 # Accepted input: the class video only; the transcript is generated from its audio
 VIDEO_EXTENSIONS = ["mp4", "mov", "mkv", "webm"]

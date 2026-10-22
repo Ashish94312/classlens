@@ -24,3 +24,6 @@ __pycache__/
 # OS / editor
 .DS_Store
 .vscode/
+
+# Local credential notes — never commit
+cred.txt

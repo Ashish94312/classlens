@@ -314,7 +314,7 @@ classDiagram
 
 ### 5.1 [config.py](../classlens/config.py) — settings
 
-Imports: `os`, `pathlib`. Imported by: ingest, transcript, metrics, runlog, llm.prompt, llm.evidence, llm.judge, app, scripts.
+Imports: `os`, `re`, `urllib.request`, `pathlib`. Imported by: ingest, transcript, metrics, runlog, llm.prompt, llm.evidence, llm.judge, app, scripts.
 
 #### Constants
 
@@ -323,7 +323,10 @@ Imports: `os`, `pathlib`. Imported by: ingest, transcript, metrics, runlog, llm.
 | `ROOT` | repo root | Path | `ENV_FILE`, `PROMPTS_DIR`, `RUN_LOG_PATH`, try_judge |
 | `ENV_FILE` | `ROOT/.env` | git-ignored secrets file | `load_env_file` default |
 | `ACCESS_CODE_ENV` | `"APP_ACCESS_CODE"` | env var name | `app.access_granted` |
-| `API_KEY_ENV` | `"ANTHROPIC_API_KEY"` | env var name | `StructuredCall._get_client` |
+| `API_KEY_ENV` | `"ANTHROPIC_API_KEY"` | env var name | `StructuredCall._get_client`, `load_eval_key` |
+| `EVAL_KEY_URL` | public Google Drive link | temporary, spend-limited evaluation key, read only when no key is configured; revoked after the evaluation; `""` = off | `load_eval_key` |
+| `EVAL_KEY_TIMEOUT_S` | 10 | seconds | `load_eval_key` |
+| `DRIVE_FILE_ID` | `/d/([\w-]{20,})\|[?&]id=([\w-]{20,})` | file id in a Drive share link | `direct_download_url` |
 | `VIDEO_EXTENSIONS` | mp4 mov mkv webm | upload filter | `app.upload_widget` |
 | `FFPROBE_TIMEOUT_S` | 60 | seconds | `ingest._run_ffprobe` |
 | `WHISPER_MODEL` | `"base"` | faster-whisper model size | `Transcriber._get_model` |
@@ -359,7 +362,10 @@ Imports: `os`, `pathlib`. Imported by: ingest, transcript, metrics, runlog, llm.
 
 | Signature | Does | Called by |
 |---|---|---|
-| `load_env_file(path: Path = ENV_FILE) -> None` | Reads `KEY=VALUE` lines (comments, quotes and `export ` prefix allowed) into `os.environ` with `setdefault`, so real environment variables win. Missing file → no-op. | `app.main`, `try_judge.main` |
+| `parse_env(text: str) -> dict[str, str]` | `KEY=VALUE` lines → dict (comments, quotes and `export ` prefix allowed) | `load_env_file`, `load_eval_key` |
+| `load_env_file(path: Path = ENV_FILE) -> None` | `.env` values into `os.environ` with `setdefault`, so real environment variables (and Streamlit secrets) win; missing file → skipped. Then, if still no `ANTHROPIC_API_KEY`, `load_eval_key()` | `app.main`, scripts |
+| `load_eval_key() -> None` | Temporary evaluation key: downloads `EVAL_KEY_URL` (timeout `EVAL_KEY_TIMEOUT_S`, at most 4 KB), takes **only** `ANTHROPIC_API_KEY` and only if it starts with `sk-ant-`, into memory (never disk or logs). Network error, missing file or no valid key → no key, and the app says so | `load_env_file` |
+| `direct_download_url(url: str) -> str` | Drive share link (`DRIVE_FILE_ID`) → `https://drive.google.com/uc?export=download&id=…`; other links unchanged | `load_eval_key` |
 
 ---
 
