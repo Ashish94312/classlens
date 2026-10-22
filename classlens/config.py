@@ -74,6 +74,40 @@ WHISPER_THREADS = 2  # the free host has about 2 cores
 WHISPER_BEAM_SIZE = 1  # greedy: 2x faster than the default 5 for 2 points less word recall (44-min class)
 WHISPER_WINDOW_S = 600  # transcribe in 10-min pieces: a whole class at once peaked at 2.2 GB
 
+# Video checks (HLD §6.2, §9.3): frames at teacher-speech moments, checked in memory with OpenCV.
+# Thresholds measured on the 12 sample classes (Zoom speaker view, 1080p); see ai-logs/DECISIONS.md.
+FACE_MODEL_PATH = ROOT / "assets" / "face_detection_yunet_2023mar.onnx"  # YuNet, MIT; OpenCV 5 has no Haar cascades
+FACE_MIN_SCORE = 0.6  # detector confidence
+VIDEO_SAMPLES = 120  # moments checked per class: about 70 s on 2 cores (Zoom keyframes are up to 30 s apart)
+VIDEO_MIN_LINE_S = 2  # teacher lines shorter than this are skipped (Zoom switches the speaker view late)
+VIDEO_MIN_TEACHER_MOMENTS = 20  # fewer teacher lines than this → evenly spaced moments instead
+FRAME_WIDTH = 640  # frames are shrunk to this width before the checks
+FREEZE_GAP_S = 1  # each moment is a pair of frames this far apart
+SPEAKER_FACE_MIN_WIDTH = 0.08  # face at least this share of the frame width = speaker view (thumbnails: ~0.03)
+GALLERY_MIN_FACES = 3  # this many faces = gallery view, the teacher can't be singled out
+DARK_LUMA = 40  # brightness 0–255 below this is dark (Zoom's camera-off card is grey ~26)
+CARD_MIN_DARK_SHARE = 0.9  # camera-off card: this share of the frame dark (the name is small white text)…
+CARD_MAX_SATURATION = 10  # … and colourless
+SCREEN_MIN_SHARPNESS = 600  # Laplacian variance: shared screens 650–3800, camera pictures 100–550
+# Speaker thumbnail during screen share as (left, top, right, bottom) shares of the frame; faces seen at x 0.83–1, y 0–0.22
+THUMBNAIL_BOX = (0.82, 0.0, 1.0, 0.24)
+LOW_LIGHT_FACE_LUMA = 45  # mean face brightness 0–255 below this = poorly lit (sample faces: 20–127)
+BLUR_MAX_SHARPNESS = 40  # Laplacian variance of a speaker-view picture below this = blurred
+FREEZE_MAX_MOTION = 0.3  # mean pixel change 0–255 over FREEZE_GAP_S below this = frozen (moving faces: 0.8+)
+EXAMPLE_MOMENTS = 3  # moments quoted per finding in the report
+
+# Video → C6 / C7 scores and gates (HLD §6.1, §6.3)
+CAMERA_OFF_MINOR = 0.05  # camera off in more than this share of teaching moments: one point off C6
+CAMERA_OFF_GATE = 0.3  # … more than this: another point off, and a gate flag (an excellent sample class
+                        # had it off 19% of the time, all in its first 15 min, without reviewer comment)
+FACE_VISIBLE_MINOR = 0.7  # face found in less than this share of camera-on moments: one point off C6
+FACE_VISIBLE_GATE = 0.3  # … less than this: another point off, and a gate flag
+LOW_LIGHT_MAX = 0.3  # face poorly lit in more than this share: one point off C6
+GALLERY_MAX = 0.5  # gallery view in more than this share: face checks skipped
+FROZEN_MAX = 0.1  # frozen in more than this share of camera moments: one point off C7
+BLURRY_MAX = 0.3  # blurred in more than this share of camera moments: one point off C7
+GATE_CAPS = {1: "Average", 2: "Poor"}  # number of gate flags → best grade allowed (2 or more → Poor)
+
 # Rubric (HLD §6.1): id → (name, weight)
 CRITERIA = {
     "C1": ("Opening and rapport", 20),

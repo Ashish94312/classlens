@@ -51,18 +51,25 @@ def test_full_run_gives_a_grade_and_fills_facts(tmp_path):
     facts = {}
     assessment = run.run(video(tmp_path), facts)
 
-    assert assessment.grade.grade == "Excellent"  # both assessed criteria scored 4 in the fake judgement
+    # Both assessed criteria score 4 in the fake judgement. The test pattern has no face in it: the video
+    # adds C6 = 2 (score (20 + 10 + 10/3) / 40 = 83.3, Excellent band) and the face gate caps it at Average.
+    assert assessment.grade.score == 83.3 and assessment.grade.grade == "Average"
+    assert assessment.video.face_visible == 0 and len(assessment.grade.flags) == 1
+    assert "moments checked while the teacher speaks" in client.calls[1]["messages"][0]["content"]  # facts reach the judge
     assert assessment.metrics.teacher_talk_share > 0.5 and assessment.judge is not None
     assert "Kabir" not in client.calls[0]["messages"][0]["content"]  # names replaced before any call
-    assert {"video_min", "has_audio", "transcription_s", "lines", "words", "grade", "score"} <= facts.keys()
+    assert {"video_min", "has_audio", "transcription_s", "lines", "words", "video_s", "frames", "grade", "score",
+            "gate_flags"} <= facts.keys()
 
 
 @needs_ffmpeg
 def test_no_audio_and_no_speech_are_explained_not_graded(tmp_path):
     silent, _ = pipeline(tmp_path, SPEECH)
-    assert silent.run(video(tmp_path, audio=False), {}).note == NO_AUDIO
+    assessment = silent.run(video(tmp_path, audio=False), {})
+    assert assessment.note == NO_AUDIO and assessment.grade is None and assessment.video.frames > 0
     empty, _ = pipeline(tmp_path, [])
-    assert empty.run(video(tmp_path), {}).note == NO_SPEECH
+    assessment = empty.run(video(tmp_path), {})
+    assert assessment.note == NO_SPEECH and assessment.video is not None
 
 
 @needs_ffmpeg
@@ -72,3 +79,4 @@ def test_ai_failure_keeps_text_quality_and_says_why(tmp_path):
     assessment = run.run(video(tmp_path), facts)
     assert assessment.grade is None and "Could not reach" in assessment.note
     assert assessment.quality is not None and facts["ai_skipped"] == "AIUnavailable"
+    assert assessment.video is not None  # the video checks still run without the AI

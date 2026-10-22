@@ -6,9 +6,9 @@ Design: [docs/HLD.md](docs/HLD.md) · AI interaction history: [ai-logs/](ai-logs
 
 ## How it works
 
-Upload a class video (mp4, mov, mkv or webm, up to 500 MB). On the server: speech-to-text with a local Whisper model → names replaced with codes (T, S, N1…) → Claude labels each line teacher / student / shared media → interaction metrics → Claude scores a 7-criterion rubric with timestamped evidence → code turns the scores into a 0–100 score and a grade. Video and audio never leave the server; only the de-identified transcript goes to the Claude API.
+Upload a class video (mp4, mov, mkv or webm, up to 500 MB). On the server: speech-to-text with a local Whisper model → names replaced with codes (T, S, N1…) → Claude labels each line teacher / student / shared media → interaction metrics → camera, face and screen checks on frames taken while the teacher speaks (OpenCV with a small face-detection model, on the server) → Claude scores a 7-criterion rubric with timestamped evidence → code turns the scores into a 0–100 score and a grade, capped at Average when the teacher's camera is mostly off or their face is not visible. Video, audio and frames never leave the server; only the de-identified transcript and the numbers from the checks go to the Claude API.
 
-A 44-minute class takes about 2.5 minutes on a laptop (Whisper about 2 min, Claude about 35 s) and about $0.15 in API calls. One analysis runs at a time; others wait their turn.
+A 44-minute class takes about 3 minutes on a laptop (Whisper about 2 min, video checks about 15 s, Claude about 35 s) and about $0.15 in API calls. One analysis runs at a time; others wait their turn.
 
 ## Run locally (no credentials needed)
 
@@ -46,7 +46,7 @@ The first analysis also downloads the Whisper speech-to-text model (about 150 MB
    ANTHROPIC_API_KEY = "sk-ant-..."
    ```
 4. Deploy. `packages.txt` installs `ffmpeg`, `requirements.txt` the Python packages (first build takes a few minutes).
-5. Run one sample class. **Manage app → Logs** shows one `"purpose": "analysis"` line per run with the real timings (`transcription_s`, `total_s`) and memory (`peak_memory_mb`).
+5. Run one sample class. **Manage app → Logs** shows one `"purpose": "analysis"` line per run with the real timings (`transcription_s`, `video_s`, `total_s`) and memory (`peak_memory_mb`).
 
 Free apps sleep after a period without visitors; open the link shortly before it is tested. A `Dockerfile` is included to run the same app on any container host.
 

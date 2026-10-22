@@ -21,12 +21,14 @@ if [ -n "$keys" ]; then
   status=1
 fi
 
-# redact_names.txt is local and git-ignored: one real name per line.
+# redact_names.txt is local and git-ignored: one real name per line. Binary files are skipped (-I):
+# short names match random bytes in files such as the face-detection model; media, PDFs and
+# transcripts are blocked by file name above.
 if [ -f redact_names.txt ]; then
   names=$(grep -v '^[[:space:]]*$' redact_names.txt || true)
   if [ -n "$names" ]; then
     # Print only file paths, never the matched names.
-    leaks=$(git grep --cached -l -i -w -F -f <(echo "$names") -- $staged || true)
+    leaks=$(git grep --cached -I -l -i -w -F -f <(echo "$names") -- $staged || true)
     if [ -n "$leaks" ]; then
       echo "Blocked: real names found in staged files:" >&2
       echo "$leaks" >&2

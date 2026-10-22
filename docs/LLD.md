@@ -4,7 +4,7 @@ Companion to [HLD.md](HLD.md). The HLD says **what** the system does and **why**
 
 **Rule:** the code matches this document. A structural change is made here first, then in code.
 
-Version 2 · 2026-10-22 · Covers everything built in phases 0–2 (ingest, transcript layer, de-identification, metrics, Claude judge). Phases 3–5 are specified as interfaces in §9.
+Version 2.8 · 2026-10-23 · Covers everything built: ingest, speech-to-text, de-identification, roles, metrics, video checks, Claude judge, scoring with video gates, pipeline and report. Audio features and the report export are specified as interfaces in §9.
 
 ---
 
@@ -44,7 +44,8 @@ classlens/
   privacy.py                   Pseudonymiser, NameGuard                                    §5.5
   metrics.py                   InteractionAnalyzer                                         §5.6
   runlog.py                    RunLog, estimate_cost(), peak_memory_mb()                   §5.11
-  scoring.py                   Scorer: criterion scores → 0–100 → Poor/Average/Good/Excellent §5.18
+  video.py                     VideoAnalyzer, FrameChecker, FaceFinder, FrameReader: camera/face/screen checks §5.20
+  scoring.py                   Scorer: criterion scores (+ video C6/C7, gates) → 0–100 → grade §5.18
   pipeline.py                  AssessmentPipeline, Assessment: the steps for one recording   §5.19
   llm/
     __init__.py                package marker
@@ -63,9 +64,11 @@ scripts/                       local-only tools for the confidential dataset    
   try_asr.py                   time Whisper; word recall against the Zoom VTT
   try_roles.py                 Whisper → names → Claude roles, checked against Zoom speakers
   evaluate.py                  full pipeline on the labelled set: grade vs label, confusion matrix
+  try_video.py                 video checks on the labelled set (Zoom VTT teacher moments; no Claude)
   build_redact_list.py         writes git-ignored redact_names.txt
   check_clean.sh               git pre-commit guard                                         §5.15
-tests/                         82 tests on synthetic data                                  §8
+assets/face_detection_yunet_2023mar.onnx  YuNet face detector (230 KB, MIT; LICENSE-yunet.txt)   §5.20
+tests/                         115 tests on synthetic data                                 §8
 docs/HLD.md, docs/LLD.md       design
 ai-logs/                       AI interaction history (redacted)
 .env.example                   template for the git-ignored .env
@@ -96,6 +99,11 @@ Dockerfile, .dockerignore      portable container build
 | The answer format Claude must return | [llm/schema.py](../classlens/llm/schema.py) › `Judgement` |
 | The API call, retry and error handling | [llm/claude.py](../classlens/llm/claude.py) › `StructuredCall` |
 | How the grade (Poor / Average / Good / Excellent) is computed | [scoring.py](../classlens/scoring.py) › `Scorer`; [config.py](../classlens/config.py) › `GRADE_BANDS` |
+| Camera off, face visible, light, screen share, freezes, blur | [video.py](../classlens/video.py) › `FrameChecker.check`, `summarise` |
+| Which moments of the video are checked | [video.py](../classlens/video.py) › `sample_times` |
+| What the video checks tell Claude | [video.py](../classlens/video.py) › `describe`; used in [pipeline.py](../classlens/pipeline.py) › `AssessmentPipeline._assess` |
+| How the video changes C6 / C7 and caps the grade (gates) | [scoring.py](../classlens/scoring.py) › `presence_score`, `technical_score`, `gate_flags`, `best_allowed` |
+| Video thresholds and how they were measured | [config.py](../classlens/config.py) (video block); [scripts/try_video.py](../scripts/try_video.py) |
 | The order of the steps for one recording | [pipeline.py](../classlens/pipeline.py) › `AssessmentPipeline.run` |
 | How accurate the grades are on the labelled set | [scripts/evaluate.py](../scripts/evaluate.py) |
 | How made-up quotes are removed | [llm/evidence.py](../classlens/llm/evidence.py) › `EvidenceValidator` |
@@ -127,12 +135,15 @@ flowchart BT
   prompt[llm.prompt] --> config & models & privacy & timecode
   evidence[llm.evidence] --> config & schema & models & timecode
   judge[llm.judge] --> config & runlog & evidence & prompt & schema & models
-  app[app.py] --> config & ingest & asr & runlog
+  video[video] --> config & models & timecode
+  scoring[scoring] --> config & schema & models
+  pipeline[pipeline] --> ingest & judge & prompt & roles[llm.roles] & metrics & models & privacy & scoring & transcript & video
+  app[app.py] --> config & ingest & asr & pipeline & runlog & scoring & video
   dataset[scripts.dataset] --> ingest & metrics & models & privacy & transcript
   scripts[scripts: inspect / try_judge / try_asr / build_redact_list] --> dataset & privacy & prompt & judge & asr & transcript & config
 ```
 
-External packages: `streamlit` (app only), `anthropic` + its bundled `pydantic` (llm only), `httpx2` (tests only, ships with `anthropic`). Standard library everywhere else. `ffmpeg`/`ffprobe` are called as programs.
+External packages: `streamlit` (app only), `anthropic` + its bundled `pydantic` (llm only), `opencv-python-headless` + `numpy` (video only), `faster-whisper` (asr only), `httpx2` (tests only, ships with `anthropic`). Standard library everywhere else. `ffmpeg`/`ffprobe` are called as programs.
 
 ### 3.2 Data flow of one analysis
 
@@ -262,6 +273,26 @@ classDiagram
     +text: str
     +lines: list~Cue~
   }
+  class VideoFindings {
+    +frames: int
+    +screen_share: float
+    +gallery: float
+    +camera_off: float
+    +face_visible: float
+    +low_light: float
+    +blurry: float
+    +frozen: float
+    +camera_off_at: list~float~
+    +no_face_at: list~float~
+    +frozen_at: list~float~
+  }
+  class GradeResult {
+    +grade: str
+    +score: float
+    +assessed_weight: float
+    +provisional: bool
+    +flags: tuple~str~
+  }
   Transcript "1" *-- "many" Cue
   PseudonymisedTranscript "1" *-- "1" Transcript
   Payload "1" *-- "many" Cue
@@ -305,6 +336,14 @@ classDiagram
 | | `score` | float | 0–100 over the assessed criteria | same | report |
 | | `assessed_weight` | float | share of the total rubric weight assessed | same | report |
 | | `provisional` | bool | assessed weight < `PROVISIONAL_MIN_WEIGHT` | same | report |
+| | `flags` | tuple[str, ...] | video gate lines that capped the grade (default `()`) | `Scorer.grade` via `gate_flags` | report |
+| **`VideoFindings`** | `frames` | int | moments whose frame pair could be read | `video.summarise` | report, `describe`, scoring |
+| | `screen_share`, `gallery` | float | share of all frames showing a shared screen / gallery view | same | same |
+| | `camera_off` | float \| None | teacher's camera off, of the frames outside gallery view (None: all gallery) | same | `presence_score`, `gate_flags` |
+| | `face_visible` | float \| None | teacher's face found, of the camera-on frames | same | same |
+| | `low_light` | float \| None | face mean brightness < `LOW_LIGHT_FACE_LUMA`, of the frames with a face | same | `presence_score` |
+| | `blurry`, `frozen` | float \| None | sharpness < `BLUR_MAX_SHARPNESS` / motion < `FREEZE_MAX_MOTION`, of the speaker-view frames with a face | same | `technical_score` |
+| | `camera_off_at`, `no_face_at`, `frozen_at` | list[float] | first `EXAMPLE_MOMENTS` moments (s) of each problem | same | `describe` |
 | **`Payload`** | `text` | str | The full user message sent to Claude | `PromptBuilder.build` | `ClaudeJudge.assess` |
 | | `lines` | list[Cue] | Transcript lines exactly as shown to Claude (merged) | `PromptBuilder.build` | `EvidenceValidator` |
 
@@ -333,6 +372,29 @@ Imports: `os`, `re`, `urllib.request`, `pathlib`. Imported by: ingest, transcrip
 | `WHISPER_THREADS` | 2 | CPU threads (the free host has about 2 cores) | `Transcriber._get_model` |
 | `WHISPER_BEAM_SIZE` | 1 | greedy; measured on a 44-min class vs the default 5: 118 s vs 235 s, word recall 0.80 vs 0.82, peak 1.2 GB vs 1.6 GB | `Transcriber._transcribe_window` |
 | `WHISPER_WINDOW_S` | 600 | seconds of audio per Whisper call (caps memory) | `Transcriber.transcribe_audio` |
+| `FACE_MODEL_PATH` | `ROOT/assets/face_detection_yunet_2023mar.onnx` | YuNet face detector (OpenCV 5 no longer ships Haar cascades) | `FaceFinder` |
+| `FACE_MIN_SCORE` | 0.6 | detector confidence | `FaceFinder` |
+| `VIDEO_SAMPLES` | 120 | moments per class (~1.1 CPU-s each: Zoom keyframes are up to 30 s apart, so each seek decodes up to 750 frames) | `sample_times` |
+| `VIDEO_MIN_LINE_S` | 2 | teacher lines shorter than this are not sampled (Zoom switches the speaker view late) | `sample_times` |
+| `VIDEO_MIN_TEACHER_MOMENTS` | 20 | fewer teacher lines → evenly spaced moments | `sample_times` |
+| `FRAME_WIDTH` | 640 | px; frames are shrunk to this width for the checks | `_shrink` |
+| `FREEZE_GAP_S` | 1 | s between the two frames of a moment | `FrameReader` |
+| `SPEAKER_FACE_MIN_WIDTH` | 0.08 | face width ÷ frame width at least this = speaker view (teacher faces 0.13–0.27; thumbnails ~0.03) | `FrameChecker.check` |
+| `GALLERY_MIN_FACES` | 3 | faces in one frame = gallery view | `FrameChecker.check` |
+| `DARK_LUMA` | 40 | brightness 0–255 below this is dark (camera-off card grey ≈ 26) | `_is_camera_off_card`, `_check_thumbnail` |
+| `CARD_MIN_DARK_SHARE`, `CARD_MAX_SATURATION` | 0.9, 10 | camera-off card: ≥ 90% dark pixels and mean saturation ≤ 10 | `_is_camera_off_card` |
+| `SCREEN_MIN_SHARPNESS` | 600 | Laplacian variance at 640 px: shared screens 650–3800, camera pictures 100–550 | `FrameChecker.check` |
+| `THUMBNAIL_BOX` | (0.82, 0, 1, 0.24) | speaker thumbnail during screen share (left, top, right, bottom shares); faces seen at x 0.83–1, y 0–0.22 | `_thumbnail` |
+| `LOW_LIGHT_FACE_LUMA` | 45 | mean face brightness below this = poorly lit (sample faces 20–127) | `summarise` |
+| `BLUR_MAX_SHARPNESS` | 40 | speaker-view sharpness below this = blurred (sample camera pictures ≥ 104) | `summarise` |
+| `FREEZE_MAX_MOTION` | 0.3 | mean pixel change over 1 s below this = frozen (sample faces ≥ 0.62) | `summarise` |
+| `EXAMPLE_MOMENTS` | 3 | moments quoted per finding | `summarise` |
+| `CAMERA_OFF_MINOR` / `CAMERA_OFF_GATE` | 0.05 / 0.3 | camera-off share for one / two points off C6; the second is also a gate | `presence_score`, `gate_flags` |
+| `FACE_VISIBLE_MINOR` / `FACE_VISIBLE_GATE` | 0.7 / 0.3 | face-visible share below which one / two points come off C6; the second is also a gate | same |
+| `LOW_LIGHT_MAX` | 0.3 | poorly lit share above which one point comes off C6 | `presence_score` |
+| `GALLERY_MAX` | 0.5 | gallery share above which C6 and gates are skipped | `presence_score`, `gate_flags` |
+| `FROZEN_MAX`, `BLURRY_MAX` | 0.1, 0.3 | shares above which one point comes off the video C7 | `technical_score` |
+| `GATE_CAPS` | {1: Average, 2: Poor} | gate flags → best grade allowed (2 or more → Poor) | `best_allowed` |
 | `CRITERIA` | C1–C7 → (name, weight): Opening and rapport 20 · Individual engagement 25 · Tone and energy 15 · Lesson flow and closure 15 · Homework 10 · Teacher presence and setup 10 · Technical delivery 5 | rubric (HLD §6.1) | `EvidenceValidator` (order, completeness), `Scorer` (weights), report (names) |
 | `GRADE_BANDS` | (78, Excellent) · (62, Good) · (48, Average) · (0, Poor) | minimum score per grade; initial, calibrated with `scripts/evaluate.py` | `Scorer._band`, app |
 | `PROVISIONAL_MIN_WEIGHT` | 0.6 | share of the rubric weight that must be assessed | `Scorer.grade` |
@@ -827,7 +889,7 @@ Never contains transcript text, names or file names (asserted by `test_judge.py`
 
 ### 5.12 [app.py](../app.py) — Streamlit UI
 
-Imports: streamlit, config, ingest. Streamlit re-runs the script top to bottom on every interaction; `main()` is called at module level.
+Imports: streamlit, config, asr, ingest, pipeline, runlog, scoring, video. Streamlit re-runs the script top to bottom on every interaction; `main()` is called at module level.
 
 | Session-state key | Meaning |
 |---|---|
@@ -844,14 +906,15 @@ Imports: streamlit, config, ingest. Streamlit re-runs the script top to bottom o
 | `run_analysis` | `(recording) -> None` | `analysis_lock` busy → `BUSY_NOTICE`, wait · `st.status` (label updated by each pipeline step) → `analyse` → store result, bump `upload_round`, rerun · `IngestError` → show message, clear result · other exception → record its type, re-raise · `finally`: release the lock, add `total_s` + `peak_memory_mb`, `RunLog().record("analysis", ok/rejected/error, facts)` | `analysis_lock`, `analyse`, `RunLog.record` | `main` |
 | `pipeline` | `() -> AssessmentPipeline` | `@st.cache_resource`: one Whisper model and one Claude client per server process, created on the first analysis | `AssessmentPipeline`, `Transcriber` | `analyse` |
 | `analyse` | `(recording, facts: dict, on_step) -> dict` | inside `TemporaryDirectory` (always deleted): `save_upload` → `run_id` → `pipeline().run(path, facts, on_step)`; returns `{"assessment"}`. Facts fill as the steps run, so the run log has them even if a later step fails | `save_upload`, `run_id`, `AssessmentPipeline.run` | `run_analysis` |
-| `show_result` | `(result: dict) -> None` | no grade → the note + measurements; else `show_grade`, `show_criteria`, `show_points`, `show_measurements`, `show_trace` | below | `main` |
-| `show_grade` | `(assessment)` | grade heading; rubric score and the AI's overall view; warnings: provisional, rubric vs AI two grades apart (`GRADE_ORDER`), transcript quality not good; summary | — | `show_result` |
+| `show_result` | `(result: dict) -> None` | no grade → the note + measurements + `show_video`; else `show_grade`, `show_criteria`, `show_points`, `show_measurements`, `show_video`, `show_trace` | below | `main` |
+| `show_grade` | `(assessment)` | grade heading; rubric score and the AI's overall view; one error per gate flag with `best_allowed`; warnings: provisional, rubric vs AI two grades apart (`scoring.GRADE_ORDER`), transcript quality not good; summary | `best_allowed` | `show_result` |
 | `show_criteria` | `(assessment)` | one expander per criterion: score or "not assessed", rationale, evidence `± [mm:ss] “quote”: observation` | — | `show_result` |
 | `show_points` | `(assessment)` | strengths and improvements side by side, each with timestamp and criterion | — | `show_result` |
 | `show_measurements` | `(assessment)` | duration, transcript quality, words/min, teacher talk share, switches/min, teacher questions/min, media minutes, long silences; roles caveat | — | `show_result` |
+| `show_video` | `(assessment)` | "Camera and screen": frames not read → caption; else camera off, face visible, shared screen tiles + `describe` lines; the frames themselves are never shown | `describe` | `show_result` |
 | `show_trace` | `(assessment)` | AI trace expander: prompt version, served model, effort, tokens, cost, latency, evidence kept | — | `show_result` |
 
-`DATA_NOTICE` — the privacy notice shown above the uploader. `BUSY_NOTICE` — shown while waiting for another session's analysis. `GRADE_ORDER` — Poor … Excellent, from `GRADE_BANDS`.
+`DATA_NOTICE` — the privacy notice shown above the uploader. `BUSY_NOTICE` — shown while waiting for another session's analysis.
 
 ---
 
@@ -876,9 +939,11 @@ Never imported by the app. Print aggregates only (no names, no transcript text).
 
 **[try_asr.py](../scripts/try_asr.py)** — `main(dataset, keys)`: for each recording with a video: `probe` (minutes) → `Transcriber().transcribe` (timed) → `words()` of the Whisper and the Zoom VTT transcripts (`WORD` = `[\w']+`, lowercased) → one row: minutes, seconds, times real time, word counts, `word_recall` (share of VTT words, with repeats, also in the Whisper output), `peak_memory_mb`. No text is printed.
 
-**[try_roles.py](../scripts/try_roles.py)** — `main(dataset, keys, names_only)`: for each recording with a video: `Transcriber().transcribe` → `Pseudonymiser(Unknown).apply` → `leaked_lines` (lines still matching any name in the local `redact_names.txt`; stricter than `NameGuard`, which only knows the names found). Any leak, or `--names-only` → print line/name counts and stop, **no Claude call**. Otherwise `RoleLabeller.label` → per line `reference_role` (Zoom cue with the most time overlap: media / teacher / student; Unknown skipped) vs `predicted_role` → accuracy, per-role recall, talk share / turn switches / teacher questions vs the Zoom-labelled metrics, and the call's tokens, cost and latency. Prints aggregates only.
+**[try_roles.py](../scripts/try_roles.py)** — `main(dataset, keys, names_only)`: for each recording with a video: `Transcriber().transcribe` → `Pseudonymiser(Unknown).apply` → `leaked_lines` (lines still matching any name in the local `redact_names.txt`, `REDACT_LIST`; stricter than `NameGuard`, which only knows the names found). Any leak, or `--names-only` → print line/name counts and stop, **no Claude call**. Otherwise `RoleLabeller.label` → per line `reference_role` (Zoom cue with the most time overlap: media / teacher / student; Unknown skipped) vs `predicted_role` → accuracy, per-role recall, talk share / turn switches / teacher questions vs the Zoom-labelled metrics, and the call's tokens, cost and latency. Prints aggregates only.
 
-**[evaluate.py](../scripts/evaluate.py)** — `main(dataset, keys, cache)`: `AssessmentPipeline(CachedTranscriber(cache), …, known_names=redact list)` on every recording → per recording: expected grade (`LABEL_TO_GRADE`: excellent/good/average as is, weak and quality issue → Poor; demos none), computed grade, score, assessed share, the AI's overall view, transcript quality → exact and within-one-grade matches and a `confusion` matrix for both the rubric grade and the AI's view, plus the run's Claude cost. `CachedTranscriber` keeps Whisper output in a local folder keyed by `run_id` (`--cache DIR`, never committed). Prints grades and aggregates only.
+**[evaluate.py](../scripts/evaluate.py)** — `main(dataset, keys, cache)`: `AssessmentPipeline(CachedTranscriber(cache), …, known_names=redact list)` on every recording → per recording: expected grade (`LABEL_TO_GRADE`: excellent/good/average as is, weak and quality issue → Poor; demos none), computed grade, score, assessed share, the AI's overall view, transcript quality, `video_summary` (camera off, face visible, dark face) and the number of gate flags → exact and within-one-grade matches and a `confusion` matrix for both the rubric grade and the AI's view, plus the run's Claude cost. `CachedTranscriber` keeps Whisper output in a local folder keyed by `run_id` (`--cache DIR`, never committed). `GRADES` = Poor … Excellent (matrix order); `REDACT_LIST` = the local `redact_names.txt`, passed as `known_names`. Prints grades and aggregates only.
+
+**[try_video.py](../scripts/try_video.py)** — `main(dataset, keys)`: for each recording with a video: `prepare` → `sample_times(clean.transcript, duration)` (teacher = Zoom VTT speaker, so no Claude call) → `VideoAnalyzer.check_all` (timed) → `summarise` → one row: frames, seconds per moment, every share, `presence_score`, `technical_score`, gate count; then `percentiles` (10/50/90) of sharpness and motion over speaker-view frames with a face, to set `BLUR_MAX_SHARPNESS` and `FREEZE_MAX_MOTION`. No frame is saved or shown.
 
 **[build_redact_list.py](../scripts/build_redact_list.py)** — `main(dataset)`: for every recording (Zoom VTT): display-name tokens of every speaker + the pseudonymiser's `name_tokens` that Zoom capitalises mid-sentence (`_word_counts`) or calls out at a sentence start (`VOCATIVE` = `Name, …`); + `feedback_names(pdf)` (teacher names via `pdftotext` and `FEEDBACK_NAME`, e.g. `") FIRST LAST -----"`) − `NOT_NAMES` − `is_common_word` (in `DICTIONARY` = `/usr/share/dict/words`, or an inflection of a word in it via `INFLECTIONS`: the system list has "line" but not "lines") → written to `OUTPUT` (`redact_names.txt`, git-ignored); prints the count. **Precision matters**: the pre-commit guard blocks any file containing a listed word, and leak checks treat each word as a real name.
 
@@ -914,7 +979,7 @@ Installed with `ln -sf ../../scripts/check_clean.sh .git/hooks/pre-commit`. On e
 
 1. Block media, transcripts, PDFs, `.env` and `secrets.toml` by file name.
 2. Block any staged content matching `sk-ant-…` (API keys).
-3. If `redact_names.txt` exists, block staged files containing any listed name (prints file paths only, never the names).
+3. If `redact_names.txt` exists, block staged text files containing any listed name (prints file paths only, never the names). Binary files are skipped (`git grep -I`): short names match random bytes in the face-detection model; media, PDFs and transcripts are already blocked by name in step 1.
 
 Exit code 1 stops the commit.
 
@@ -956,38 +1021,118 @@ Measured against Zoom speaker labels with `scripts/try_roles.py` (HLD §9.6).
 
 ### 5.18 [scoring.py](../classlens/scoring.py) — the final grade
 
-Imports: config, llm.schema, models. Imported by: pipeline.
+Imports: config, llm.schema, models. Imported by: pipeline, app, scripts.try_video.
+
+`GRADE_ORDER` — Poor … Excellent, from `GRADE_BANDS` (also used by the app).
 
 **`Scorer`** (no state)
 
 | Method | Signature | Returns | Steps | Called by |
 |---|---|---|---|---|
-| `grade` | `(judgement: Judgement) -> GradeResult` | grade, score, assessed weight, provisional | for each assessed criterion with a score: `weighted += weight × (score − 1) / 3`, `assessed_weight += weight` (weights from `CRITERIA`) · nothing assessed → Poor, 0, provisional · `score = 100 × weighted ÷ assessed_weight` (unassessed criteria don't count against the teacher) · `provisional` if assessed weight < `PROVISIONAL_MIN_WEIGHT` of the total · `_band(score)` | `AssessmentPipeline.run` |
+| `grade` | `(judgement: Judgement, video: VideoFindings \| None = None) -> GradeResult` | grade, score, assessed weight, provisional, flags | `criterion_scores` · for each: `weighted += weight × (score − 1) / 3`, `assessed_weight += weight` (weights from `CRITERIA`) · nothing assessed → Poor, 0, provisional · `score = 100 × weighted ÷ assessed_weight` (unassessed criteria don't count against the teacher) · `provisional` if assessed weight < `PROVISIONAL_MIN_WEIGHT` of the total · `_band(score)` · `gate_flags(video)` · `_cap` | `AssessmentPipeline._assess` |
+| `criterion_scores` | `(judgement, video) -> dict[str, float]` (static) | assessed id → score | Claude's assessed scores · with video: **C6** = lower of Claude's (transcript cues) and `presence_score` (video alone if Claude didn't assess it) · **C7** = mean of Claude's and `technical_score` | `grade`, tests |
 | `_band` | `(score) -> str` | grade | first `GRADE_BANDS` entry whose minimum the score reaches | `grade` |
 
-Version 1 uses Claude's criterion scores only; the metric blends of HLD §6.1 (e.g. C2 = 0.5 LLM + 0.5 metrics) and the video/audio gates of §6.3 join once their cut-points are calibrated.
+| Function | Signature | Does | Called by |
+|---|---|---|---|
+| `presence_score` | `(video) -> int \| None` | C6 from the video: 4 minus one point per problem — camera off > `CAMERA_OFF_MINOR`, > `CAMERA_OFF_GATE`; face visible < `FACE_VISIBLE_MINOR`, < `FACE_VISIBLE_GATE`; poorly lit > `LOW_LIGHT_MAX` — never below 1. None when gallery > `GALLERY_MAX` | `criterion_scores`, try_video |
+| `technical_score` | `(video) -> int \| None` | C7 from the video: 4 minus one point each for frozen > `FROZEN_MAX`, blurred > `BLURRY_MAX`. None without speaker-view face frames | same |
+| `gate_flags` | `(video) -> tuple[str, ...]` | HLD §6.3 gates as report lines: camera off > `CAMERA_OFF_GATE`; face visible < `FACE_VISIBLE_GATE`. None or gallery view → `()` | `grade`, try_video |
+| `best_allowed` | `(flag_count) -> str` | 0 → Excellent; 1 → Average; 2+ → Poor (`GATE_CAPS`) | `_cap`, `app.show_grade` |
+| `_cap` | `(grade, flag_count) -> str` | the lower of the grade and `best_allowed` | `grade` |
+
+Still to come (HLD §6.1): metric blends for C2 (turn-taking) and C3 (audio), the background gate (needs a logo template), and the complaints gate.
 
 ---
 
 ### 5.19 [pipeline.py](../classlens/pipeline.py) — one recording → one assessment
 
-Imports: ingest, llm.claude, llm.judge, llm.prompt, llm.roles, metrics, models, privacy, scoring, transcript. Imported by: app, scripts.evaluate.
+Imports: ingest, llm.claude, llm.judge, llm.prompt, llm.roles, metrics, models, privacy, scoring, transcript, video. Imported by: app, scripts.evaluate.
 
 | Name | Kind | Meaning |
 |---|---|---|
-| `NO_AUDIO`, `NO_SPEECH` | const | user-facing notes when nothing can be assessed |
-| `Assessment` | frozen dataclass | `media`, `quality`, `metrics`, `judge` (`JudgeResult`), `grade` (`GradeResult`), `note`: everything the report shows; `grade` None → `note` says why |
+| `NO_AUDIO`, `NO_SPEECH` | const | user-facing notes when the teaching can't be assessed (the video checks still ran) |
+| `Assessment` | frozen dataclass | `media`, `quality`, `metrics`, `judge` (`JudgeResult`), `grade` (`GradeResult`), `note`, `video` (`VideoFindings`): everything the report shows; `grade` None → `note` says why; `video` None → frames not readable |
 
 **`AssessmentPipeline(transcriber, labeller=None, judge=None, known_names=frozenset())`** — collaborators injected (tests: fakes; evaluation: cached transcriber). `known_names`: casefolded names always replaced (evaluation passes the local real-name list).
 
 | Method | Signature | Returns | Steps | Called by |
 |---|---|---|---|---|
-| `run` | `(video_path, facts: dict, on_step) -> Assessment` | Assessment | 1 `probe` (no audio → note) · 2 `transcriber.transcribe` (timed; no cues → note) · 3 `TranscriptAnalyzer.quality` · 4 `Pseudonymiser(Unknown, known_names).apply` · 5 `RoleLabeller.label` · 6 `InteractionAnalyzer.compute` · 7 `PromptBuilder.build` → `ClaudeJudge.assess` · `AIUnavailable` / `PrivacyError` → Assessment with quality and the error as note · 8 `Scorer.grade`. Adds `video_min`, `has_audio`, `transcription_s`, `lines`, `words`, `grade`, `score`, `holistic_grade` (or `ai_skipped`) to `facts`; `on_step(text)` before each slow step | `app.analyse`, `evaluate.main` |
+| `run` | `(video_path, facts: dict, on_step) -> Assessment` | Assessment | 1 `probe` (no audio → `_check_video` on evenly spaced moments + `NO_AUDIO`) · 2 `transcriber.transcribe` (timed; no cues → same with `NO_SPEECH`) · 3 `TranscriptAnalyzer.quality` · 4 `Pseudonymiser(Unknown, known_names).apply` · 5 `RoleLabeller.label` (`AIUnavailable` / `PrivacyError` → `_check_video` on evenly spaced moments, Assessment with quality and the error as note) · 6 `_assess`. Adds `video_min`, `has_audio`, `transcription_s`, `lines`, `words` (or `ai_skipped`) to `facts`; `on_step(text)` before each slow step | `app.analyse`, `evaluate.main` |
+| `_assess` | `(video_path, media, quality, labelled, facts, on_step) -> Assessment` | Assessment | `InteractionAnalyzer.compute` · `_check_video(labelled.transcript)` · `PromptBuilder(describe(video)).build` → `ClaudeJudge.assess` (`AIUnavailable` / `PrivacyError` → Assessment with metrics, video and the error as note) · `Scorer.grade(judgement, video)`. Adds `grade`, `score`, `holistic_grade`, `gate_flags` | `run` |
+| `_check_video` | `(video_path, transcript \| None, media, facts, on_step) -> VideoFindings \| None` (static) | findings, or None | `VideoAnalyzer(video_path).analyse(sample_times(transcript, duration))`; `VideoError` → `facts["video_skipped"]`, None. Adds `video_s`, `frames` | `run`, `_assess` |
 
 ```mermaid
 flowchart LR
-  run --> probe & Transcriber.transcribe & TranscriptAnalyzer.quality & Pseudonymiser.apply & RoleLabeller.label & InteractionAnalyzer.compute & PromptBuilder.build & ClaudeJudge.assess & Scorer.grade
+  run --> probe & Transcriber.transcribe & TranscriptAnalyzer.quality & Pseudonymiser.apply & RoleLabeller.label & _assess & _check_video
+  _assess --> InteractionAnalyzer.compute & _check_video & describe & PromptBuilder.build & ClaudeJudge.assess & Scorer.grade
+  _check_video --> sample_times & VideoAnalyzer.analyse
 ```
+
+---
+
+### 5.20 [video.py](../classlens/video.py) — camera, face and screen checks
+
+Imports: cv2 (`opencv-python-headless`), numpy, dataclasses, enum, config, models, timecode. Imported by: pipeline, app, scripts.try_video.
+
+Frames are decoded into memory with OpenCV, checked and dropped: none is written, shown or sent anywhere; only `VideoFindings` leave. Zoom records the **speaker view**: the person speaking fills the frame (or Zoom's dark camera-off card with their name); while a screen is shared the speaker is a thumbnail top-right. Frames are taken while the teacher speaks, so the speaker on view is the teacher.
+
+| Name | Kind | Meaning |
+|---|---|---|
+| `VideoError` | exception | frames can't be read; message shown as-is |
+| `Layout` | StrEnum | `SPEAKER` (teacher's camera or card fills the frame) · `SCREEN` (shared screen, teacher = thumbnail) · `GALLERY` (≥ `GALLERY_MIN_FACES` faces) |
+| `FrameCheck` | frozen dataclass | `at_s`, `layout`, `camera_off`, `face_luma` (None: no face), `sharpness` and `motion` (speaker-view frames with a face only) |
+
+| Function / method | Signature | Does | Called by |
+|---|---|---|---|
+| `sample_times` | `(transcript \| None, duration_s) -> list[float]` | midpoints of teacher (`T`, not media) lines ≥ `VIDEO_MIN_LINE_S`, at most `VIDEO_SAMPLES` spread evenly through the list; fewer than `VIDEO_MIN_TEACHER_MOMENTS` (or no transcript) → `VIDEO_SAMPLES` evenly spaced moments | `AssessmentPipeline._check_video`, try_video |
+| **`FrameReader(media_path)`** | | `cv2.VideoCapture`; not opened → `VideoError`; frames per `FREEZE_GAP_S` from the stream's fps (25 if unknown) | `VideoAnalyzer.check_all` |
+| `.pair` | `(at_s) -> (first, second) \| None` | seek to `at_s`, read; then `grab()` forward to `FREEZE_GAP_S` later and read (a second seek would decode from the keyframe again: measured 2.15 vs 1.14 CPU-s per moment); None past the end | `check_all` |
+| `.close` | `() -> None` | release the capture | `check_all` (`finally`) |
+| **`FaceFinder(model_path=FACE_MODEL_PATH)`** | | `cv2.FaceDetectorYN` (YuNet) with `FACE_MIN_SCORE`; model file missing (e.g. `assets/` not deployed) → `VideoError` | `VideoAnalyzer` |
+| `.find` | `(image) -> list[(x, y, w, h)]` | set input size, detect, clip negative corners, widest first | `FrameChecker` |
+| **`FrameChecker(faces)`** | | | `VideoAnalyzer` |
+| `.check` | `(at_s, first, second) -> FrameCheck` | shrink to `FRAME_WIDTH`, grey, faces → ≥ `GALLERY_MIN_FACES` → gallery · widest face ≥ `SPEAKER_FACE_MIN_WIDTH` → speaker view with face: `face_luma` (`_mean_in`), `sharpness`, `motion` vs the second frame · `_is_camera_off_card` → camera off · sharpness ≥ `SCREEN_MIN_SHARPNESS` → `_check_thumbnail` · else speaker view, camera on, no face | `check_all` |
+| `._check_thumbnail` | `(at_s, frame) -> FrameCheck` | `_thumbnail` of the **full-resolution** frame (the face there is ~60 px at 1080p, ~19 px once shrunk) → face → its brightness · no face: mean below `DARK_LUMA` → camera off, else face not visible | `check` |
+| **`VideoAnalyzer(media_path, faces=None)`** | | `FrameChecker(faces or FaceFinder())` | pipeline, try_video |
+| `.analyse` | `(moments) -> VideoFindings` | `check_all` (a `cv2.error` → `VideoError`) → none read → `VideoError` → `summarise` | `AssessmentPipeline._check_video` |
+| `.check_all` | `(moments) -> list[FrameCheck]` | `FrameReader.pair` per moment (unreadable ones skipped) → `FrameChecker.check`; reader closed in `finally` | `analyse`, try_video |
+| `summarise` | `(checks) -> VideoFindings` | shares over the frames that can show each thing: camera off of non-gallery frames; face visible of camera-on frames; low light of frames with a face; blurred and frozen of speaker-view frames with a face; first `EXAMPLE_MOMENTS` moments of camera off / no face / frozen | `analyse`, try_video |
+| `describe` | `(video) -> list[str]` | sentences for Claude and the report, e.g. "Teacher's camera off in 12% of them (e.g. 05:10, 12:31)"; shares that are None are left out | `AssessmentPipeline._assess`, `app.show_video` |
+| `_examples`, `_share` | helpers | " (e.g. mm:ss, …)"; count ÷ total rounded, None when total is 0 | `describe`, `summarise` |
+| `_shrink`, `_thumbnail` | `(frame) -> frame` | resize to `FRAME_WIDTH` (INTER_AREA); crop `THUMBNAIL_BOX` | `check` |
+| `_sharpness` | `(gray) -> float` | variance of the Laplacian: sharp text/board edges high, camera pictures low | `check` |
+| `_motion` | `(gray, later) -> float` | mean absolute pixel difference | `check` |
+| `_mean_in` | `(gray, box) -> float` | mean brightness inside a face box | `check`, `_check_thumbnail` |
+| `_is_camera_off_card` | `(image, gray) -> bool` | ≥ `CARD_MIN_DARK_SHARE` of pixels below `DARK_LUMA` and mean saturation ≤ `CARD_MAX_SATURATION` | `check` |
+
+```mermaid
+flowchart TB
+  analyse --> check_all --> FrameReader.pair & FrameChecker.check
+  analyse --> summarise
+  FrameChecker.check --> FaceFinder.find & _shrink & _sharpness & _motion & _mean_in & _is_camera_off_card & _check_thumbnail
+  _check_thumbnail --> _thumbnail & FaceFinder.find & _mean_in
+  describe --> _examples --> format_time
+```
+
+```mermaid
+flowchart TD
+  F[frame pair] --> G{3+ faces?}
+  G -- yes --> GAL[gallery: skipped for teacher shares]
+  G -- no --> B{face ≥ 8% of width?}
+  B -- yes --> SP[speaker view with face: brightness, sharpness, motion]
+  B -- no --> C{dark and colourless?}
+  C -- yes --> OFF[camera off]
+  C -- no --> S{sharp: Laplacian ≥ 600?}
+  S -- no --> NF[speaker view, face not visible]
+  S -- yes --> T{face in top-right thumbnail?}
+  T -- yes --> SF[screen share with face: brightness]
+  T -- no --> D{thumbnail dark?}
+  D -- yes --> OFF
+  D -- no --> NF
+```
+
+Measured on the 12 sample classes (`scripts/try_video.py`, aggregates only): 0.11–0.17 s per moment on a laptop; 49–120 moments per class; screen share on 53–98% of teacher moments; the quality-issue class B441 shows its face in 3% of camera-on moments (reviewer: "face not visible"); no freezes or blur found in any class.
 
 ---
 
@@ -1042,6 +1187,7 @@ flowchart TB
 | `IngestError` | ingest.py | `probe`, `_run_ffprobe` | unreadable file, zero length, no video stream | `app.run_analysis` shows the message |
 | `PrivacyError` | privacy.py | `NameGuard.check` (via `PromptBuilder.build`, `RoleLabeller.label`) | a real name would leave the server | phase 4 pipeline: skip AI step, local-only, flag it |
 | `AIUnavailable` | llm/claude.py | `StructuredCall.run` for `ClaudeJudge` and `RoleLabeller` (no key, 401, 429, other API error, connection, refusal, unreadable twice) | AI step can't run | `try_judge.main` prints it; phase 4 pipeline: local-only + banner |
+| `VideoError` | video.py | `FrameReader.__init__`, `FaceFinder.__init__` (model missing), `VideoAnalyzer.analyse` (no frames, OpenCV error) | frames can't be read | `AssessmentPipeline._check_video`: `video_skipped` fact, findings None, report says so |
 | `ValueError` | built-in | `InteractionAnalyzer.__init__` | no attributed speech | phase 4 pipeline: transcript criteria not assessed |
 
 Every user-facing message is written in the exception itself; no stack traces reach the UI.
@@ -1050,11 +1196,11 @@ Every user-facing message is written in the exception itself; no stack traces re
 
 ## 8. Tests
 
-`.venv/bin/python -m pytest` — 82 tests, synthetic data only, no network.
+`.venv/bin/python -m pytest` — 115 tests, synthetic data only, no network.
 
 | Test file | Module | Tests | Covers |
 |---|---|---|---|
-| test_config.py | config | 2 | `.env` parsing, precedence, missing file |
+| test_config.py | config | 8 | `.env` parsing, precedence, missing file |
 | test_models.py | models | 2 | `Transcript` helpers, `QualityLevel` text |
 | test_timecode.py | timecode | 2 | format / parse incl. hours and ranges |
 | test_ingest.py | ingest | 6 | probe on generated media (video+audio, silent video, audio-only rejected, corrupt), generic upload name, run id from content not name |
@@ -1066,8 +1212,9 @@ Every user-facing message is written in the exception itself; no stack traces re
 | test_judge.py | llm.claude, llm.judge | 12 | request shape, retry, refusal, unreadable, 401/429/500/connection, missing key, log has no transcript text, refusal logged, versioned system prompt |
 | test_roles.py | llm.roles | 3 | unlisted lines = teacher, student/media mapping, out-of-range numbers ignored, request text and prompt, name guard blocks the call |
 | test_runlog.py | runlog | 4 | cost per token kind, missing cache fields, JSON lines written and printed, peak memory |
-| test_scoring.py | scoring | 8 | uniform scores per level, bands between levels, unassessed criteria ignored, provisional, nothing assessed |
-| test_pipeline.py | pipeline | 3 | full run on a generated video with fake transcriber + fake Claude (grade, facts, names replaced before any call), no audio, no speech, AI failure keeps quality |
+| test_scoring.py | scoring | 18 | uniform scores per level, bands between levels, unassessed criteria ignored, provisional, nothing assessed, video C6 per problem level, video C7, C6 = lower / C7 = mean, gates cap at Average / Poor, gallery skips gates |
+| test_pipeline.py | pipeline | 3 | full run on a generated video with fake transcriber + fake Claude (face gate caps the grade, findings reach the judge, facts, names replaced before any call), no audio / no speech still run the video checks, AI failure keeps quality and video |
+| test_video.py | video | 17 | speaker view with face (light, sharpness, motion), frozen pair, camera-off card, face not found, screen share thumbnail (face / lit / dark), gallery, `summarise` denominators and example moments, empty shares, gallery only, `describe` text, `sample_times` (teacher lines, spread, fallback), real YuNet model loads, generated video, unreadable file, missing model, OpenCV error → `VideoError` |
 | test_asr.py | asr | 1 | fake Whisper model: 25 s in 10 s windows → 3 calls, times shifted per window, empty segments dropped, VAD on |
 
 Helpers: [tests/fakes.py](../tests/fakes.py) — sample cues, metrics, `judgement()`, `response()`, `FakeClient` (stands in for `anthropic.Anthropic`).
@@ -1082,9 +1229,8 @@ Interfaces to implement; they follow the same conventions.
 |---|---|---|---|
 | audio.py › `AudioAnalyzer(media_path)` | `speech_activity() -> list[float]` | per-second RMS | `ffmpeg` → 16 kHz mono PCM → NumPy |
 | | `teacher_features(intervals) -> AudioFeatures` | loudness variation, pitch variability, speech rate, dropouts, dead air | intervals = teacher cue times |
-| video.py › `VideoAnalyzer(media_path, logo_path)` | `analyse(sample_times) -> VideoFindings` | camera-off %, face-visible %, low-light %, branded background %, screen-share %, freezes, blur | frames stay in memory; OpenCV |
-| | `VideoFindings.facts() -> list[str]` | sentences for `PromptBuilder(findings)` | must pass `NameGuard` |
-| scoring.py › `Scorer` (v2) | metric blends per criterion and video/audio gates (HLD §6.1, §6.3), confidence | | once cut-points are calibrated |
+| video.py › branded background | `VideoFindings.branded_background` | share of speaker-view frames matching the 8x8 logo (`cv2.matchTemplate`) | needs a logo template image (`assets/brand_logo.png`) |
+| scoring.py › `Scorer` (v3) | C2 / C3 metric blends, background and complaints gates, confidence (HLD §6.1, §6.3) | | once calibrated |
 | report.py › `ReportRenderer` | `to_markdown(report)`, `to_json(report)` | str | UI view and download |
 
 ---
@@ -1150,6 +1296,10 @@ Added `llm/claude.py` (`StructuredCall`, `CallStats`, `AIUnavailable`, `load_pro
 ### v2.7 — 2026-10-22: four-grade classification end to end
 
 Added `scoring.py` › `Scorer` (criterion scores → 0–100 → `GRADE_BANDS`), `models.GradeResult`, `pipeline.py` › `AssessmentPipeline` + `Assessment`, `Pseudonymiser(known_names=…)`, the report page in `app.py` (`show_grade`, `show_criteria`, `show_points`, `show_measurements`, `show_trace`; progress via `st.status`), `scripts/evaluate.py`. Removed `app.transcriber` (now `app.pipeline`). Tests: 70 → 82.
+
+### v2.8 — 2026-10-23: video checks
+
+Added `video.py` (`sample_times`, `FrameReader`, `FaceFinder`, `FrameChecker`, `FrameCheck`, `Layout`, `VideoAnalyzer`, `summarise`, `describe`, `VideoError`), `models.VideoFindings`, `GradeResult.flags`, the video block of `config.py`, `assets/face_detection_yunet_2023mar.onnx`, `scripts/try_video.py`, `test_video.py`. `Scorer.grade(judgement, video)` (v2): `criterion_scores`, `presence_score`, `technical_score`, `gate_flags`, `best_allowed`, `GRADE_ORDER` (moved from app). `AssessmentPipeline`: `_assess`, `_check_video`; findings go into the prompt; without audio, speech or AI the video checks still run. App: `show_video`, gate flags in `show_grade`. Haar cascade (HLD) → YuNet: OpenCV 5 dropped `CascadeClassifier`. Thresholds measured on the 12 sample classes, aggregates only. A missing model file or an OpenCV error skips the video checks instead of failing the analysis. Tests: 88 → 115.
 
 ### v2 verification
 

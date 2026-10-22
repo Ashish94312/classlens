@@ -18,6 +18,8 @@ from classlens.asr import Transcriber
 from classlens.ingest import IngestError, run_id, save_upload
 from classlens.pipeline import Assessment, AssessmentPipeline
 from classlens.runlog import RunLog, peak_memory_mb
+from classlens.scoring import GRADE_ORDER, best_allowed
+from classlens.video import describe
 
 DATA_NOTICE = (
     "Your recording is processed on this server and deleted when the analysis finishes. "
@@ -25,7 +27,6 @@ DATA_NOTICE = (
     "(names replaced with codes such as T, S, N1) is sent to the AI model."
 )
 BUSY_NOTICE = "Another assessment is running on this server. Yours starts as soon as it finishes."
-GRADE_ORDER = [grade for _, grade in reversed(config.GRADE_BANDS)]  # Poor … Excellent
 
 
 def access_granted() -> bool:
@@ -105,11 +106,13 @@ def show_result(result: dict) -> None:
     if assessment.grade is None:
         st.warning(assessment.note)
         show_measurements(assessment)
+        show_video(assessment)
         return
     show_grade(assessment)
     show_criteria(assessment)
     show_points(assessment)
     show_measurements(assessment)
+    show_video(assessment)
     show_trace(assessment)
 
 
@@ -117,6 +120,8 @@ def show_grade(assessment: Assessment) -> None:
     grade, judgement = assessment.grade, assessment.judge.judgement
     st.header(f"Grade: {grade.grade}")
     st.write(f"Rubric score **{grade.score:.0f}/100** · AI's overall view: **{judgement.holistic_grade}**")
+    for flag in grade.flags:
+        st.error(f"{flag}: the grade can be at most {best_allowed(len(grade.flags))}.")
     if grade.provisional:
         st.warning(f"Provisional: only {grade.assessed_weight:.0%} of the rubric could be assessed from this recording.")
     if abs(GRADE_ORDER.index(grade.grade) - GRADE_ORDER.index(judgement.holistic_grade)) >= 2:
@@ -164,6 +169,23 @@ def show_measurements(assessment: Assessment) -> None:
         cols[2].metric("Teacher questions", f"{metrics.teacher_questions_per_min:.1f}/min")
         st.caption(f"Shared video or audio: {metrics.media_minutes:.0f} min · silences over {config.LONG_GAP_S} s: "
                    f"{metrics.long_gaps}. Speaker roles come from the transcript text and can be wrong on some lines.")
+
+
+def show_video(assessment: Assessment) -> None:
+    """Camera and screen checks; the frames themselves are never shown."""
+    st.subheader("Camera and screen")
+    video = assessment.video
+    if video is None:
+        st.caption("The video frames could not be read, so the camera and screen checks were skipped.")
+        return
+    cols = st.columns(3)
+    cols[0].metric("Teacher's camera off", "—" if video.camera_off is None else f"{video.camera_off:.0%}")
+    cols[1].metric("Face visible (camera on)", "—" if video.face_visible is None else f"{video.face_visible:.0%}")
+    cols[2].metric("Shared screen", f"{video.screen_share:.0%}")
+    for fact in describe(video):
+        st.markdown(f"- {fact}")
+    st.caption("Frames are checked on this server and never stored or shown. Camera and face checks use "
+               "Zoom's speaker view; a branded background is not checked yet.")
 
 
 def show_trace(assessment: Assessment) -> None:

@@ -52,6 +52,15 @@ def confusion(rows: list[tuple[str, str]]) -> str:
     return "\n".join(lines)
 
 
+def video_summary(video) -> str:
+    """Camera-off and face-visible shares, e.g. "camera off 9% face 100%"."""
+    if video is None:
+        return "video not read"
+    face = "-" if video.face_visible is None else f"{video.face_visible:.0%}"
+    camera_off = "-" if video.camera_off is None else f"{video.camera_off:.0%}"
+    return f"camera off {camera_off} face {face} dark {video.low_light or 0:.0%}"
+
+
 def main(dataset: Path, keys: set[str], cache: Path | None) -> None:
     config.load_env_file()
     known_names = frozenset()
@@ -75,7 +84,8 @@ def main(dataset: Path, keys: set[str], cache: Path | None) -> None:
             grade, judgement = assessment.grade, assessment.judge.judgement
             print(f"{recording.name:22} expected {expected or '-':>9}  got {grade.grade:>9} ({grade.score:5.1f}, "
                   f"assessed {grade.assessed_weight:.0%})  AI overall {judgement.holistic_grade:>9}  "
-                  f"transcript {judgement.transcript_quality}", flush=True)
+                  f"transcript {judgement.transcript_quality}  {video_summary(assessment.video)}  "
+                  f"flags {len(grade.flags)}", flush=True)
             if expected:
                 computed.append((expected, grade.grade))
                 holistic.append((expected, judgement.holistic_grade))

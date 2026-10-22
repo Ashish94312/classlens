@@ -88,6 +88,24 @@ class InteractionMetrics:
 
 
 @dataclass(frozen=True)
+class VideoFindings:
+    """What the frames sampled at teacher-speech moments show (HLD §6.2). Shares are 0–1; None
+    when no sampled frame could show it (e.g. no face found, so no face brightness)."""
+
+    frames: int  # moments checked
+    screen_share: float  # shared screen on view (the teacher is a thumbnail)
+    gallery: float  # gallery view: the teacher can't be singled out
+    camera_off: float | None  # teacher's camera off, of the frames outside gallery view
+    face_visible: float | None  # teacher's face found, of the camera-on frames
+    low_light: float | None  # face poorly lit, of the frames with a face
+    blurry: float | None  # picture blurred, of the speaker-view frames with a face
+    frozen: float | None  # picture unchanged FREEZE_GAP_S later, of the speaker-view frames with a face
+    camera_off_at: list[float]  # first few moments (s) of each problem, for the report
+    no_face_at: list[float]
+    frozen_at: list[float]
+
+
+@dataclass(frozen=True)
 class GradeResult:
     """The final classification and how it was reached."""
 
@@ -95,6 +113,7 @@ class GradeResult:
     score: float  # 0–100, weighted over the assessed criteria
     assessed_weight: float  # share of the total rubric weight that could be assessed
     provisional: bool  # assessed_weight below PROVISIONAL_MIN_WEIGHT
+    flags: tuple[str, ...] = ()  # video gates that capped the grade (HLD §6.3)
 
 
 @dataclass(frozen=True)

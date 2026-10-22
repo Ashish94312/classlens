@@ -2,7 +2,7 @@
 
 AI-assisted quality assessment for recorded online chess classes (8x8). Upload a class recording → get a grade (Poor / Average / Good / Excellent) with specific, timestamped observations.
 
-Status: design v1 · 2026-10-22 · implementation follows this document; deviations get logged in `ai-logs/DECISIONS.md`. Code-level detail (every file, class and function): [LLD.md](LLD.md).
+Status: design v1.1 · 2026-10-23 (video checks built) · implementation follows this document; deviations get logged in `ai-logs/DECISIONS.md`. Code-level detail (every file, class and function): [LLD.md](LLD.md).
 
 ---
 
@@ -148,8 +148,8 @@ Each row names the module and its main classes; [LLD.md](LLD.md) documents every
 | `app.py` | Streamlit UI only | — | §5.12 |
 | `asr.py` › `Transcriber` | Every recording: local `faster-whisper` (base, int8, CPU, greedy, 10-min windows) → `Transcript` of unlabelled lines | Only module that needs the extra package | §9 |
 | `audio.py` › `AudioAnalyzer` *(phase 3)* | Teacher loudness variation, pitch variability, speech rate, long silences | `ffmpeg` → 16 kHz mono PCM pipe → NumPy | §9 |
-| `video.py` › `VideoAnalyzer` *(phase 3)* | Sample frames at teacher-speech timestamps (~150, each as a pair 1 s apart): camera-off card, face visible, face brightness, branded background, screen share, frozen video, blur. Frames stay in memory; only aggregated facts leave | `ffmpeg -ss` seeks; OpenCV Haar cascade, `matchTemplate`, luminance, frame differencing, Laplacian variance | §9 |
-| `scoring.py` › `Scorer` | Criterion scores → weighted 0–100 over assessed criteria → Poor / Average / Good / Excellent; provisional below 60% assessed. v1 uses Claude's criterion scores; metric blends and video/audio gates follow once calibrated | Pure Python, config-driven | LLD §5.18 |
+| `video.py` › `VideoAnalyzer`, `FrameChecker`, `FaceFinder` | Check frames at teacher-speech moments (120, each a pair 1 s apart): speaker view / screen share / gallery, camera-off card, teacher's face visible (full frame, or the top-right thumbnail during screen share), face brightness, frozen video, blur. Frames stay in memory; only aggregated facts leave. Branded background not yet (needs a logo template) | OpenCV `VideoCapture` seeks; YuNet face detector (`FaceDetectorYN`); luminance, saturation, Laplacian variance, frame differencing | §5.20 |
+| `scoring.py` › `Scorer` | Criterion scores → weighted 0–100 over assessed criteria → Poor / Average / Good / Excellent; provisional below 60% assessed. Claude's criterion scores; C6 and C7 also from the video checks; camera-off and face-visible gates cap the grade. C2/C3 metric blends follow once calibrated | Pure Python, config-driven | LLD §5.18 |
 | `pipeline.py` › `AssessmentPipeline` | The steps for one recording in order, progress for the UI, facts for the run log; used by the app and `scripts/evaluate.py` | Injected collaborators | LLD §5.19 |
 | report page (in `app.py`) | Grade, rubric score vs the AI's overall view, per-criterion evidence, strengths / improvements, measurements, AI trace | Streamlit | LLD §5.12 |
 
@@ -185,13 +185,13 @@ Step detail:
 3. **Pseudonymise, then label roles.** Every capitalised word is a name candidate, wherever it appears ("hi Rohan", "Rohan, can you…", "ask Rohan", "Rohan." alone); it becomes `N1..Nn` unless it is a known non-name (days, languages, chess pieces and openings…) or is used like a common word: never capitalised mid-sentence and written in lowercase at least twice as often as capitalised ("Bishop" opening a sentence, "bishop" elsewhere). Speech-to-text sometimes writes a name in lowercase, so one lowercase use is not enough; once a word is a name, every spelling of it is replaced. Measured on 6 real classes: names were left in 25 lines with "any lowercase use = not a name", in 2 with this rule. Then one low-effort Claude call on the pseudonymised lines labels each line `T` (teacher) or `S` (student); individual students can't be told apart without speaker labels.
 4. **Metrics** (§6.2) from the pseudonymised cues.
 5. **Audio.** Decode once; compute features over teacher cue intervals only; normalise against reference statistics from the labelled set.
-6. **Video.** Seek-sample ~150 frames at 640 px, weighted to teacher-speech timestamps plus a uniform background sample. Classify each frame (camera-off card / camera / screen share). Aggregate to percentages over teaching time.
+6. **Video.** Check 120 moments at the middle of teacher lines (evenly spaced when there are no labelled lines, e.g. no audio). Each moment is a pair of frames 1 s apart, shrunk to 640 px. Classify each (speaker view with face / camera-off card / speaker view without face / screen share, judged by the top-right thumbnail / gallery) and aggregate to shares of teaching moments, with example times.
 7. **LLM judge** (§7). One call, ~15–25k input tokens.
 8. **Validate** cited evidence against the transcript.
 9. **Score**, apply gates, compute confidence.
 10. **Report** and delete temp files (in a `finally` block).
 
-Expected latency per 60-min recording on a 2-vCPU host (to be measured in Phase 0): audio 20–40 s, frames 30–90 s, LLM 30–90 s → **~2–4 min**. Whisper adds ~6–12 min for a full 60-min class, so it dominates the run time.
+Expected latency per 60-min recording on a 2-vCPU host (to be measured in Phase 0): audio 20–40 s, frames ~70 s (measured ~1.1 CPU-s per moment: Zoom puts keyframes up to 30 s apart, so each seek decodes up to 750 frames), LLM 30–90 s → **~2–4 min**. Whisper adds ~6–12 min for a full 60-min class, so it dominates the run time.
 
 ---
 
@@ -208,7 +208,7 @@ Each criterion is scored 1–4 (1 = weak, 4 = excellent) with level descriptors 
 | C3 | Tone and energy — pleasant, encouraging, energetic, clear | 15 | 0.7 LLM + 0.3 audio metrics |
 | C4 | Lesson flow and closure — recap → concept → practice/puzzles → summary; media used | 15 | LLM (+ media-share metric as evidence) |
 | C5 | Homework — explicit, specific homework in the closing segment | 10 | LLM on closing window (4 = specific HW, 3 = mentioned, 1 = none) |
-| C6 | Teacher presence and setup — camera on, face visible, adequate light, 8x8 background | 10 | Video metrics (+ transcript cues like "sir, we can't see you") |
+| C6 | Teacher presence and setup — camera on, face visible, adequate light, 8x8 background | 10 | Video metrics; the lower of the video score and the LLM's score from transcript cues ("sir, we can't see you") |
 | C7 | Technical delivery — audio/network problems, frozen or blurry video, dead air | 5 | 0.5 LLM (complaints in context) + 0.5 metrics (dead air, video freezes, blur) |
 
 Metric → 1–4 mapping uses cut-points derived from the labelled set (stored in `config.py`, not hard-coded in logic).
@@ -229,10 +229,10 @@ Metric → 1–4 mapping uses cut-points derived from the labelled set (stored i
 
 - `score = Σ weight_c × (s_c − 1) / 3` → 0–100, renormalised over assessed criteria when some evidence is missing (§9.5).
 - **Gates** (critical flags from the "known quality issue" pattern):
-  - teacher camera off > 20% of teacher speech;
-  - teacher face visible < 30% of camera frames;
-  - no branded background in > 70% of camera frames;
-  - ≥ 3 student/teacher complaints about audio or video quality.
+  - teacher camera off > 30% of teacher speech (first set at 20%; an Excellent sample class had it off 19% of the time, all in its first 15 minutes, with no reviewer comment);
+  - teacher face visible < 30% of camera-on frames;
+  - no branded background in > 70% of camera frames *(not built: needs a logo template)*;
+  - ≥ 3 student/teacher complaints about audio or video quality *(not built: the LLM's C7 covers complaints)*.
 
   One flag caps the grade at Average; two or more cap it at Poor.
 - **Grade bands** (initial, calibrated in Phase 4): Excellent ≥ 78 · Good 62–77 · Average 48–61 · Poor < 48.
@@ -377,7 +377,7 @@ The mode is chosen automatically from what `ffprobe` finds, and shown at the top
 | Mode | Input | Transcript from | Speakers from | Assessed | Max confidence |
 |---|---|---|---|---|---|
 | **B** Video | Video with audio | Local Whisper | LLM role labelling (teacher vs student) on scrubbed text: 73–81% of lines match the Zoom speakers on 3 sample classes; teacher talk share within 6 points, turn switches 15–30% low (one Whisper segment can hold a question and its answer) | C1–C7; per-student metrics (participation balance) not available | Medium |
-| **E** Silent video | Video, no usable audio | — | — | C6 and visual C7 only | Low, grade marked **Provisional** |
+| **E** Silent video | Video, no usable audio | — | — | Video checks only (camera, face, light, screen share), shown without a grade: 15% of the rubric can't support a teaching grade | — (no grade) |
 | — | Audio-only, corrupt or unsupported file | — | — | Rejected with a clear message | — |
 
 The brief promises only the recording, so no transcript upload is offered. The Zoom VTTs that came with the labelled set are used offline only: to check Whisper's words and the role labeller against real speaker labels. (Letters B and E are kept from the earlier five-mode design.)
@@ -402,7 +402,7 @@ Mode B privacy: Whisper output has no speaker labels to harvest names from. Name
 | Laggy / frozen video | Frame pairs 1 s apart nearly identical **while the teacher is speaking and a face is present** | Counted as a freeze (C7). Static screen-share frames are excluded, since an unchanged chessboard is normal |
 | Choppy audio | Repeated short drop-outs (RMS near zero for 0.1–0.5 s) inside speech | C7 metric |
 | Low resolution, blur, dark video | Laplacian variance; luminance | Reported; face-check thresholds scale with frame size; dark frames raise a lighting flag instead of "face missing" |
-| Non-standard layout (gallery view, screen share throughout, portrait phone) | Faces per frame; aspect ratio; screen-share ratio | Gallery → C6 face checks skipped (teacher can't be singled out); screen share throughout → use the top-right thumbnail; confidence lowered |
+| Non-standard layout (gallery view, screen share throughout, portrait phone) | Faces per frame; screen-share ratio | Gallery (3+ faces) in > 50% of moments → C6 video score and gates skipped (teacher can't be singled out); screen share → the teacher is checked in the top-right thumbnail at full resolution (the usual case: 53–98% of teacher moments in the samples) |
 | Unusual stream order (one sample has a data stream) | `ffprobe` stream types | Select streams by type (`-map 0:a:0`), never by index |
 | No audio track, or silent audio | `ffprobe`; RMS level | Audio features and transcript skipped → Mode E |
 | Corrupt or truncated file (incomplete upload, missing moov atom) | `ffprobe` error; decoded duration shorter than declared | Tolerant decode of the readable part, coverage reported; otherwise rejected with a clear message |
@@ -454,7 +454,7 @@ Unit tests on synthetic fixtures cover parser variants (SRT, BOM, missing speake
 | Language | Python 3.11 | Fastest path for media + AI |
 | UI | Streamlit | Allowed by brief; upload widget, progress status, expanders |
 | Media | `ffmpeg` / `ffprobe` (system binary, via `subprocess`) | No Python wrapper library needed |
-| Vision | `opencv-python-headless` | Bundled Haar face cascade, template matching; small and CPU-only |
+| Vision | `opencv-python-headless` | YuNet face detector (`FaceDetectorYN`, 230 KB MIT model file in `assets/`: OpenCV 5 no longer bundles Haar cascades); seeking, colour and edge measures; CPU-only |
 | Numerics | `numpy` | Audio RMS / pitch, frame stats |
 | LLM | `anthropic` SDK (+ its bundled Pydantic) | Structured outputs, typed errors, retries |
 | Speech-to-text | `faster-whisper` | Local, CPU int8; runs on every recording |
@@ -523,7 +523,7 @@ Downloadable JSON contains the same data.
 
 **Run log** (`logs/runs.jsonl`, not committed; every line is also printed, because on Streamlit Community Cloud only the app's output in Manage app → Logs survives a restart):
 
-- one `analysis` line per run: `ts, outcome (ok / rejected / error + exception type), run_id (SHA-256 of the first 1 MB), waited_s, video_min, has_audio, transcription_s, lines, words, total_s, peak_memory_mb`;
+- one `analysis` line per run: `ts, outcome (ok / rejected / error + exception type), run_id (SHA-256 of the first 1 MB), waited_s, video_min, has_audio, transcription_s, lines, words, video_s, frames (or video_skipped), grade, score, gate_flags, total_s, peak_memory_mb`;
 - one line per Claude call (`roles`, `judge`): `ts, outcome, prompt_version, model, effort, attempts, input/output tokens, cost_usd, latency_s, served_model, stop_reason` + step counts (evidence accepted/rejected, role line counts).
 
 No transcript text, no names, no file names.
@@ -580,16 +580,18 @@ classlens/
     evidence.py             # EvidenceValidator
     judge.py                # ClaudeJudge
   runlog.py                 # RunLog
-  asr.py                    # (phase 3) optional Whisper fallback
+  asr.py                    # local Whisper speech-to-text
   audio.py                  # (phase 3)
-  video.py                  # (phase 3)
+  video.py                  # camera, face and screen checks
   scoring.py                # Scorer
   pipeline.py               # AssessmentPipeline
 prompts/judge_v1.md, judge_v2.md, judge_v3.md, roles_v1.md
-assets/brand_logo.png       # (phase 3) 8x8 logo template for background detection
+assets/face_detection_yunet_2023mar.onnx  # face detector model (MIT)
+assets/brand_logo.png       # (to do) 8x8 logo template for background detection
 scripts/dataset.py          # local-only dataset helpers
 scripts/inspect_transcripts.py, try_judge.py, build_redact_list.py
-scripts/evaluate.py         # (phase 4)
+scripts/evaluate.py         # full pipeline on the labelled set
+scripts/try_video.py        # video checks on the labelled set (no Claude)
 scripts/export_ai_log.py    # (phase 5)
 scripts/check_clean.sh      # pre-commit guard: no media, transcripts, keys or names
 tests/                      # synthetic fixtures only — one test file per module
@@ -627,7 +629,7 @@ Stretch, if time remains: parallel audio/video extraction; prompt v3 from evalua
 | Code-mixed / non-English speech garbles transcripts | Transcript quality score (§9.2); timing metrics still used; confidence lowered |
 | Overfitting to 10 examples | Rubric comes from reviewer criteria; only cut-points are calibrated; leave-one-out reported |
 | Zoom gallery view instead of speaker view breaks teacher-frame mapping | Detect multi-tile layouts (many faces per frame) → skip C6 face checks, lower confidence |
-| Haar cascade misses angled or poorly lit faces | Use ratios over ~150 frames with tolerant thresholds; low light is itself reported |
+| Face detector misses angled or poorly lit faces | YuNet instead of Haar; ratios over 120 moments with tolerant thresholds; low light is itself reported. One sample teacher in a dark room is found in 42% of camera-on moments |
 | Large uploads fail or the app runs out of memory on the free host | Validate in Phase 0 with a 300 MB file; Drive-link input as fallback; windowed Whisper; Dockerfile allows moving hosts |
 | Name slips past pseudonymisation | Payload guard (§8.2 R3) blocks the call; residual risk documented |
 
