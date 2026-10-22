@@ -2,7 +2,7 @@
 
 AI-assisted quality assessment for recorded online chess classes (8x8). Upload a class recording → get a grade (Poor / Average / Good / Excellent) with specific, timestamped observations.
 
-Status: design v1 · 2026-10-22 · implementation follows this document; deviations get logged in `ai-logs/DECISIONS.md`.
+Status: design v1 · 2026-10-22 · implementation follows this document; deviations get logged in `ai-logs/DECISIONS.md`. Code-level detail (every file, class and function): [LLD.md](LLD.md).
 
 ---
 
@@ -10,7 +10,7 @@ Status: design v1 · 2026-10-22 · implementation follows this document; deviati
 
 | Requirement (from challenge brief) | How this design meets it |
 |---|---|
-| Accept a new recording (upload or link) | Streamlit upload (mp4 + optional Zoom `.vtt`) or a Google Drive / direct link |
+| Accept a new recording (upload or link) | Streamlit upload of the class video (mp4, mov, mkv, webm) or a Google Drive / direct link. No transcript is expected: it is generated on the server from the video's audio |
 | Classify as Poor / Average / Good / Excellent | Weighted rubric score (0–100) → grade bands calibrated on the labelled set |
 | Explain with specific observations, not generic statements | Every observation carries a timestamp + quote or a measured number; ungrounded LLM claims are dropped by a validator |
 | Genuinely process an unseen recording | Full pipeline runs on the input: transcript, audio, video frames, LLM judgement |
@@ -75,8 +75,8 @@ Conclusions:
 1. **Privacy first.** Raw video, audio and frames are processed only on the app server. Nothing visual is sent to any external AI service. Transcript text is pseudonymised before the LLM call.
 2. **Hybrid, not LLM-only.** Deterministic measurements (talk ratios, camera-on time, homework window) anchor the grade; the LLM judges what rules cannot (rapport, tone, clarity) and writes grounded explanations. Final grade is computed in code → reproducible and explainable.
 3. **Grounded explanations.** Every LLM claim must cite a timestamp + quote that exists in the transcript; the validator drops anything that doesn't match.
-4. **Few dependencies, simple code.** Standard library + 4 runtime packages. `ffmpeg` called as a subprocess, VTT parsed by hand, audio maths in NumPy.
-5. **Graceful degradation.** No VTT → local speech-to-text. No API key / LLM not permitted → rules-only mode still returns a grade with lower confidence.
+4. **Few dependencies, simple code.** Standard library + 5 runtime packages. `ffmpeg` called as a subprocess, VTT parsed by hand, audio maths in NumPy.
+5. **Graceful degradation.** The transcript always comes from local speech-to-text; no audio → visual checks only, provisional grade. No API key / LLM not permitted → rules-only mode still returns a grade with lower confidence.
 6. **Fits the timebox.** ~5 h of build; free hosting.
 
 ---
@@ -91,9 +91,9 @@ flowchart LR
   subgraph Server["App server (Streamlit Community Cloud) — raw media never leaves"]
     UI[Streamlit UI<br/>access code gate]
     ING[Ingest<br/>validate · temp dir · ffprobe]
-    TR[Transcript<br/>VTT parse / local Whisper fallback]
-    ROLE[Roles<br/>detect teacher]
-    PRIV[Pseudonymise<br/>names → T, S1..Sn]
+    TR[Transcript<br/>local Whisper speech-to-text]
+    ROLE[Roles<br/>teacher vs student per line]
+    PRIV[Pseudonymise<br/>names in speech → N1..Nn]
     MET[Interaction metrics]
     AUD[Audio features<br/>ffmpeg → NumPy]
     VID[Video features<br/>speech-aligned frames → OpenCV]
@@ -106,8 +106,9 @@ flowchart LR
     LLM[Claude Opus 5.5<br/>rubric judge<br/>structured output]
   end
 
-  U -- mp4 + optional .vtt / link --> UI --> ING
-  ING --> TR --> ROLE --> PRIV --> MET
+  U -- video file / link --> UI --> ING
+  ING --> TR --> PRIV --> ROLE --> MET
+  PRIV -- pseudonymised lines --> LLM
   ROLE -. teacher speech times .-> AUD
   ROLE -. teacher speech times .-> VID
   ING --> AUD
@@ -128,21 +129,29 @@ Trust boundary: only the arrows into the Anthropic box cross it, and they carry 
 
 ### 4.1 Components
 
-| Module | Responsibility | Key techniques |
-|---|---|---|
-| `ingest.py` | Accept upload or link, size/type check, write to temp dir, `ffprobe` metadata, guaranteed cleanup | `tempfile`, `subprocess`, `urllib` (Drive: `drive.usercontent.google.com/download?id=…&confirm=t`) |
-| `transcript.py` | Parse VTT → `Cue(start, end, speaker, text)`; merge same-speaker runs; tag `Audio shared by` cues as media; detect teacher; compact for prompt | ~40 lines of regex, no VTT library |
-| `asr.py` *(fallback)* | If no VTT: local `faster-whisper` (base, int8, CPU); speaker roles inferred by one low-effort LLM call on pseudonymised text | Lazy import; only path that needs the extra package |
-| `privacy.py` | Map speaker labels → `T`, `S1..Sn`; replace those names (and names caught by greeting patterns) inside text; strip emails/phone numbers | Whole-word regex replacement; mapping kept in memory only |
-| `metrics.py` | Talk shares, turn switches/min, teacher questions/min, students addressed by name, participation balance (Gini), opening/closing windows, media-share time, dead air | Pure Python |
-| `audio.py` | Teacher loudness variation, pitch variability, speech rate, long silences | `ffmpeg` → 16 kHz mono PCM pipe → NumPy (RMS, autocorrelation pitch) |
-| `video.py` | Sample frames at teacher-speech timestamps (~150 frames, each as a pair 1 s apart); per frame: camera-off card, face visible, face brightness, branded background, screen share, frozen video, blur. Frames stay in memory; only aggregated facts leave this module | `ffmpeg -ss` seeks; OpenCV Haar face cascade, `matchTemplate` for the 8x8 logo, luminance stats, frame differencing (freeze), Laplacian variance (blur) |
-| `judge.py` | Build prompt, call Claude with structured output, validate evidence, handle refusal / errors | `anthropic` SDK `messages.parse` + Pydantic schema |
-| `scoring.py` | Blend LLM and metric scores per criterion, apply weights and gates, grade, confidence | Pure Python, config-driven |
-| `report.py` | Render report (Markdown in UI + downloadable JSON) | — |
-| `ailog.py` | Append one JSON line per LLM call (no content) | `json` |
-| `pipeline.py` | Orchestrate steps, emit progress for the UI | — |
-| `app.py` | Streamlit UI only | — |
+Each row names the module and its main classes; [LLD.md](LLD.md) documents every function inside them (section in the last column).
+
+| Module › main classes | Responsibility | Key techniques | LLD |
+|---|---|---|---|
+| `models.py` › `Cue`, `Transcript`, `PseudonymisedTranscript`, `InteractionMetrics`, `Payload`, `QualityLevel`… | Data types passed between modules | Frozen dataclasses, enums | §4 |
+| `config.py` | Every threshold, weight, model setting; `.env` loading | — | §5.1 |
+| `ingest.py` › `save_upload`, `probe` | Accept the video upload (link in phase 5), write to temp dir, `ffprobe` metadata; reject files without video | `tempfile`, `subprocess`; Drive links via `urllib` (phase 5) | §5.3 |
+| `transcript.py` › `TranscriptParser`, `TranscriptAnalyzer` | Text quality of a `Transcript`. `TranscriptParser` reads the labelled set's Zoom VTTs, used offline only to measure speech-to-text and role-labelling accuracy | Named regexes, no VTT library | §5.4 |
+| `privacy.py` › `Pseudonymiser`, `NameGuard` | Names said in class (any capitalised word, unless it is used like a common word) → `N1..Nn`; contact details removed; outbound name check. Zoom VTTs (offline): speakers → `T`, `S1..Sn` | Whole-word regex; mapping in memory only | §5.5 |
+| `metrics.py` › `InteractionAnalyzer` | Talk share, turn switches, questions, media time, long gaps | Pure Python | §5.6 |
+| `llm/prompt.py` › `PromptBuilder` | Build the only payload sent to Claude; run `NameGuard` | Phase-marked transcript lines | §5.8 |
+| `llm/claude.py` › `StructuredCall` | One structured-output Claude call shared by both AI steps: retry, refusal, error messages, log | `anthropic` SDK `beta.messages.parse` + Pydantic schema (`llm/schema.py`) | §5.7, §5.10 |
+| `llm/roles.py` › `RoleLabeller` | Label each pseudonymised line teacher / student / media (low effort) | `prompts/roles_v1.md` | §5.17 |
+| `llm/judge.py` › `ClaudeJudge` | Rubric judgement (medium effort), then the evidence check | `prompts/judge_v3.md` | §5.10 |
+| `llm/evidence.py` › `EvidenceValidator` | Drop quotes that can't be found at the cited time | stdlib `difflib` | §5.9 |
+| `runlog.py` › `RunLog` | One JSON line per analysis and per AI call (numbers only), also printed for the host's log view | `json` | §5.11 |
+| `app.py` | Streamlit UI only | — | §5.12 |
+| `asr.py` › `Transcriber` | Every recording: local `faster-whisper` (base, int8, CPU, greedy, 10-min windows) → `Transcript` of unlabelled lines | Only module that needs the extra package | §9 |
+| `audio.py` › `AudioAnalyzer` *(phase 3)* | Teacher loudness variation, pitch variability, speech rate, long silences | `ffmpeg` → 16 kHz mono PCM pipe → NumPy | §9 |
+| `video.py` › `VideoAnalyzer` *(phase 3)* | Sample frames at teacher-speech timestamps (~150, each as a pair 1 s apart): camera-off card, face visible, face brightness, branded background, screen share, frozen video, blur. Frames stay in memory; only aggregated facts leave | `ffmpeg -ss` seeks; OpenCV Haar cascade, `matchTemplate`, luminance, frame differencing, Laplacian variance | §9 |
+| `scoring.py` › `Scorer` | Criterion scores → weighted 0–100 over assessed criteria → Poor / Average / Good / Excellent; provisional below 60% assessed. v1 uses Claude's criterion scores; metric blends and video/audio gates follow once calibrated | Pure Python, config-driven | LLD §5.18 |
+| `pipeline.py` › `AssessmentPipeline` | The steps for one recording in order, progress for the UI, facts for the run log; used by the app and `scripts/evaluate.py` | Injected collaborators | LLD §5.19 |
+| report page (in `app.py`) | Grade, rubric score vs the AI's overall view, per-criterion evidence, strengths / improvements, measurements, AI trace | Streamlit | LLD §5.12 |
 
 ---
 
@@ -154,16 +163,12 @@ sequenceDiagram
   participant A as Streamlit app
   participant P as Pipeline (server)
   participant C as Claude API
-  R->>A: access code, upload mp4 (+ .vtt) or paste link
-  A->>P: run(file_path, vtt_path?)
+  R->>A: access code, upload video or paste link
+  A->>P: run(file_path)
   P->>P: ffprobe · extract audio (16 kHz mono)
-  alt VTT provided
-    P->>P: parse VTT, detect teacher
-  else no VTT
-    P->>P: local Whisper transcription
-    P->>C: label speaker roles (pseudonymised text)
-  end
-  P->>P: pseudonymise → metrics → audio features
+  P->>P: local Whisper transcription → pseudonymise
+  P->>C: label speaker roles (pseudonymised text)
+  P->>P: metrics → audio features
   P->>P: sample frames at teacher-speech times → OpenCV checks
   P->>C: rubric judge (transcript + facts) → JSON
   C-->>P: criteria scores + timestamped evidence
@@ -175,9 +180,9 @@ sequenceDiagram
 
 Step detail:
 
-1. **Ingest.** Accept `.mp4/.mov/.mkv/.webm` ≤ 2 GB; optional `.vtt`. Compute a SHA-256 of the first 1 MB as a run id (no filenames in logs).
-2. **Transcript.** Parse cues. Teacher = speaker with the most words, excluding `Audio shared by …` cues; a speaker who also appears as `Audio shared by X` (the host) is preferred on ties. The UI shows the detected teacher with an override dropdown.
-3. **Pseudonymise.** Teacher → `T`; other speakers → `S1..Sn` in order of first appearance. Names from speaker labels and greeting patterns ("hi Rohan", "Rohan, can you…") are replaced in the text.
+1. **Ingest.** Accept `.mp4/.mov/.mkv/.webm` ≤ 500 MB; reject files without a video stream. Compute a SHA-256 of the first 1 MB as a run id (no filenames in logs).
+2. **Transcript.** Local Whisper speech-to-text on the extracted audio (auto language, built-in VAD to skip silence). Whisper gives timed lines but no speaker labels.
+3. **Pseudonymise, then label roles.** Every capitalised word is a name candidate, wherever it appears ("hi Rohan", "Rohan, can you…", "ask Rohan", "Rohan." alone); it becomes `N1..Nn` unless it is a known non-name (days, languages, chess pieces and openings…) or is used like a common word: never capitalised mid-sentence and written in lowercase at least twice as often as capitalised ("Bishop" opening a sentence, "bishop" elsewhere). Speech-to-text sometimes writes a name in lowercase, so one lowercase use is not enough; once a word is a name, every spelling of it is replaced. Measured on 6 real classes: names were left in 25 lines with "any lowercase use = not a name", in 2 with this rule. Then one low-effort Claude call on the pseudonymised lines labels each line `T` (teacher) or `S` (student); individual students can't be told apart without speaker labels.
 4. **Metrics** (§6.2) from the pseudonymised cues.
 5. **Audio.** Decode once; compute features over teacher cue intervals only; normalise against reference statistics from the labelled set.
 6. **Video.** Seek-sample ~150 frames at 640 px, weighted to teacher-speech timestamps plus a uniform background sample. Classify each frame (camera-off card / camera / screen share). Aggregate to percentages over teaching time.
@@ -186,7 +191,7 @@ Step detail:
 9. **Score**, apply gates, compute confidence.
 10. **Report** and delete temp files (in a `finally` block).
 
-Expected latency per 60-min recording on a 2-vCPU host (to be measured in Phase 0): audio 20–40 s, frames 30–90 s, LLM 30–90 s → **~2–4 min**. Whisper fallback adds ~6–12 min.
+Expected latency per 60-min recording on a 2-vCPU host (to be measured in Phase 0): audio 20–40 s, frames 30–90 s, LLM 30–90 s → **~2–4 min**. Whisper adds ~6–12 min for a full 60-min class, so it dominates the run time.
 
 ---
 
@@ -198,9 +203,9 @@ Each criterion is scored 1–4 (1 = weak, 4 = excellent) with level descriptors 
 
 | ID | Criterion | Weight | Score source |
 |---|---|---|---|
-| C1 | Opening and rapport — warm greeting, names, small talk, new joiners introduce themselves, no cold start into revision | 20 | LLM (first 10 min), greeting metrics as evidence |
-| C2 | Individual engagement — questions addressed to named students, everyone included, students talk | 25 | 0.5 LLM + 0.5 metrics (turn switches/min, teacher talk %, % students addressed by name, participation balance) |
-| C3 | Tone and energy — pleasant, encouraging, energetic, clear | 15 | 0.7 LLM + 0.3 audio/praise metrics |
+| C1 | Opening and rapport — warm greeting, names, small talk, new joiners introduce themselves, no cold start into revision | 20 | LLM (first 10 min) |
+| C2 | Individual engagement — questions addressed to named students, everyone included, students talk | 25 | 0.5 LLM + 0.5 metrics (turn switches/min, teacher talk %, teacher questions/min); named-question share shown as evidence only. Whether every child is involved is judged by the LLM from names said in class |
+| C3 | Tone and energy — pleasant, encouraging, energetic, clear | 15 | 0.7 LLM + 0.3 audio metrics |
 | C4 | Lesson flow and closure — recap → concept → practice/puzzles → summary; media used | 15 | LLM (+ media-share metric as evidence) |
 | C5 | Homework — explicit, specific homework in the closing segment | 10 | LLM on closing window (4 = specific HW, 3 = mentioned, 1 = none) |
 | C6 | Teacher presence and setup — camera on, face visible, adequate light, 8x8 background | 10 | Video metrics (+ transcript cues like "sir, we can't see you") |
@@ -213,8 +218,7 @@ Metric → 1–4 mapping uses cut-points derived from the labelled set (stored i
 - Teacher talk share (words), excluding media audio.
 - Teacher↔student turn switches per minute.
 - Teacher questions per minute; share of questions that name a student.
-- Students addressed by name ÷ students present; Gini of student turns (inclusion balance).
-- Opening window (first 10 min): greetings, names used, minutes before lesson content starts.
+- Opening window (first 10 min): text passed to the LLM for rapport. Greetings, praise and whether the class opening is in the clip are judged by the LLM in context, not by keyword counts (§2.3).
 - Closing window (last 10 min): text passed to the LLM for homework and summary checks.
 - Media share: minutes of `Audio shared` cues; screen-share frame ratio.
 - Camera-off ratio and face-visible ratio during teacher speech; face luminance; branded-background ratio.
@@ -245,7 +249,7 @@ Metric → 1–4 mapping uses cut-points derived from the labelled set (stored i
 |---|---|---|
 | Rapport, tone, structure, homework, clarity | **LLM rubric judge** | Needs meaning; keyword rules proved misleading (§2.3) |
 | Explanations | LLM, grounded in timestamps + quotes and validated | Specific, not generic, and checkable |
-| Speech-to-text when no VTT | Local Whisper (on server) | Audio of children never leaves the server |
+| Speech-to-text | Local Whisper (on server) | Audio of children never leaves the server |
 | Faces / camera / background | Classical CV (OpenCV) locally | Sending children's faces to an external vision model is not acceptable; simple CV is enough for these checks |
 | Talk ratios, turn-taking | Deterministic code | Exact, cheap, reproducible |
 | Final grade | Deterministic weighted score | Stable across runs; LLM can't swing the grade alone |
@@ -258,10 +262,10 @@ Metric → 1–4 mapping uses cut-points derived from the labelled set (stored i
 - Prompt caching on the stable system prompt + rubric (helps evaluation runs over 12 recordings).
 - Cost estimate: ~20k input + ~3–6k output tokens ≈ **$0.15–0.25 per recording**; full labelled-set evaluation ≈ $3.
 
-### 7.3 Prompt (versioned file `prompts/judge_v1.md`)
+### 7.3 Prompt (versioned file `prompts/judge_v3.md`)
 
 - **System:** role (quality reviewer for kids' online chess classes); rubric with 1–4 anchored descriptors per criterion; rules: cite `[mm:ss]` + short exact quote for every claim; say "not observable" instead of guessing; judge teaching behaviour, not chess content accuracy; when the transcript looks garbled, report it and lower the score's weight via `transcript_quality`; no generic praise.
-- **User:** recording facts (duration, students present, media minutes); metrics table; video/audio findings as plain sentences ("teacher camera off 00:12–00:18 while speaking"); the compacted transcript with phase markers `=== OPENING (0–10 min) ===`, `=== MAIN ===`, `=== CLOSING (last 10 min) ===`. Lines look like `[12:31] T: S3, which piece can fork here?`.
+- **User:** recording facts (duration, transcript quality, media minutes); metrics table; video/audio findings as plain sentences ("teacher camera off 00:12–00:18 while speaking"); the compacted transcript with phase markers `=== OPENING (0–10 min) ===`, `=== MAIN ===`, `=== CLOSING (last 10 min) ===`. Lines look like `[12:31] T: N3, which piece can fork here?`.
 
 ### 7.4 Output schema
 
@@ -290,7 +294,7 @@ class Judgement(BaseModel):
 
 ### 7.5 Grounding validator
 
-For each `Evidence`: find cues within ±5 s of the timestamp; accept if the quote fuzzy-matches (stdlib `difflib`, ratio ≥ 0.6). Rejected evidence is removed from the report and counted; the rejection rate is shown in the AI trace and feeds confidence. Strengths/improvements with no surviving evidence are dropped.
+For each `Evidence`: find transcript lines (as shown to the model) within ±5 s of the timestamp; accept if the normalised quote is contained in a line, or if ≥ 80% of its characters are found in order there (stdlib `difflib`, counting only matching runs of 4+ characters so scattered letters don't count). Rejected evidence is removed from the report and counted; the rejection rate is shown in the AI trace and feeds confidence. Strengths/improvements with no surviving evidence are dropped.
 
 ### 7.6 Making AI use visible
 
@@ -314,7 +318,7 @@ Principle: **data minimisation**. Each service receives the least identifying fo
 |---|---|---|---|---|
 | Video, frames | Processed in memory; temp file deleted after run | Never | Never | Never (from session 02 on) |
 | Audio | Processed on server (features, local Whisper); deleted after run | Never | Never | Never |
-| Transcript | Parsed, then pseudonymised | Pseudonymised text only (`T`, `S1..Sn`) | Never | Synthetic fixtures + aggregate numbers only |
+| Transcript | Parsed, then pseudonymised | Pseudonymised text only (`T`, `S`, `N1..Nn`) | Never | Synthetic fixtures + aggregate numbers only |
 | Real names | In-memory mapping, discarded after run | Never (guard blocks the call) | Never | Never |
 | Results | Shown to the uploader, pseudonymised | — | Aggregate evaluation only | Aggregate only |
 
@@ -333,14 +337,15 @@ Children are identifiable three ways: **face**, **voice** and **name**. Face and
 
 - Access-code gate (`APP_ACCESS_CODE` secret) before the upload widget; one analysis at a time, so the app can't be used as an open service.
 - Ephemeral processing: everything lives in a `tempfile.TemporaryDirectory()` that is removed when the run ends, success or failure. Frames are piped from `ffmpeg` straight into NumPy; no image files are written.
-- No storage: no database, no caching of media, no video or frames shown back in the UI. The report uses `T` / `S1..Sn`.
+- No storage: no database, no caching of media, no video or frames shown back in the UI. The report uses `T` / `S` / `N1..Nn`.
 - Logs hold metadata only (run-id hash, prompt version, tokens, latency, flags).
 - The repo the app deploys from contains code only. Keys live in the platform's secrets settings.
 - A short notice above the uploader states what is processed where and that files are deleted after analysis.
 
 **R3 — permitted processing, children identifiable**
 
-- **Single exit point:** `privacy.build_llm_payload()` is the only function whose output reaches `judge.py`. Before returning, it checks the payload against every original speaker name and name token. If any remain, it raises instead of sending. Unit-tested.
+- **Single exit point:** `PromptBuilder.build()` (`llm/prompt.py`) builds the only text sent to the model, using `NameGuard` (`privacy.py`). Before returning, it checks everything derived from the recording (transcript lines and video/audio findings) against every real name token. If any remain, it raises instead of sending. Unit-tested.
+- **When unsure, treat it as a name.** Any capitalised word is replaced unless it is a known common word or used like one (never capitalised mid-sentence and written in lowercase at least twice as often as capitalised). Over-replacing (e.g. a rare word at a sentence start) costs some readability; missing a name would send it out. Before any Claude call in development, `scripts/try_roles.py` checks the text against the full local list of real names.
 - Visual and audio analysis is local only: OpenCV for camera/face/background checks, local Whisper for speech-to-text. No vision or speech API is called.
 - The Claude API runs under Anthropic's commercial terms (API inputs are not used for training). If the organiser requires it, zero data retention can be arranged with Anthropic for the organisation.
 - **Local-only mode:** a switch that skips the LLM and grades from deterministic metrics only, for cases where no external service is allowed.
@@ -364,31 +369,27 @@ Real inputs will be messy: no transcript, wrong transcript, laggy video, missing
 
 ### 9.1 Input modes
 
-The mode is chosen automatically from what `ffprobe` and the transcript parser find, and shown at the top of the report.
+The mode is chosen automatically from what `ffprobe` finds, and shown at the top of the report.
 
 | Mode | Input | Transcript from | Speakers from | Assessed | Max confidence |
 |---|---|---|---|---|---|
-| **A** Full | Video + VTT | VTT | VTT labels | C1–C7 | High |
-| **B** Video only | Video with audio | Local Whisper | LLM role labelling (teacher vs student) on scrubbed text | C1–C7; per-student metrics weaker (no student identities) | Medium |
-| **C** Transcript only | VTT / SRT | VTT | VTT labels | C1–C5, C7 from text; C6 only from transcript cues ("we can't see you") | Medium |
-| **D** Audio only | `.mp3` / `.m4a` / `.wav` | Local Whisper | LLM role labelling | As C, plus audio features | Medium |
-| **E** Video, no usable audio, no transcript | Video | — | — | C6 and visual C7 only | Low, grade marked **Provisional** |
-| — | Corrupt or unsupported file | — | — | Rejected with a clear message | — |
+| **B** Video | Video with audio | Local Whisper | LLM role labelling (teacher vs student) on scrubbed text: 73–81% of lines match the Zoom speakers on 3 sample classes; teacher talk share within 6 points, turn switches 15–30% low (one Whisper segment can hold a question and its answer) | C1–C7; per-student metrics (participation balance) not available | Medium |
+| **E** Silent video | Video, no usable audio | — | — | C6 and visual C7 only | Low, grade marked **Provisional** |
+| — | Audio-only, corrupt or unsupported file | — | — | Rejected with a clear message | — |
 
-Mode B privacy: Whisper output has no speaker labels to harvest names from. Names are found through vocative patterns ("hi X", "X, can you…", "good job X") and title-case words mid-sentence that are not in a built-in allowlist of common and chess words (Knight, Sicilian…). Residual risk is higher than in Mode A and is stated in the report.
+The brief promises only the recording, so no transcript upload is offered. The Zoom VTTs that came with the labelled set are used offline only: to check Whisper's words and the role labeller against real speaker labels. (Letters B and E are kept from the earlier five-mode design.)
+
+Mode B privacy: Whisper output has no speaker labels to harvest names from. Names are found as capitalised words that are not on a built-in list of common and chess words (Knight, Sicilian…) and are not used like a common word (never capitalised mid-sentence and written in lowercase at least twice as often as capitalised). A name speech-to-text only ever writes in lowercase is missed: on the 12 sample classes, 2 lines in 2 classes. Residual risk is higher than with Zoom's labelled transcripts and is stated in the report.
 
 ### 9.2 Transcript problems
 
 | Problem | Detection | Handling |
 |---|---|---|
-| No transcript | No file uploaded | Mode B: Whisper (auto language, built-in VAD to skip silence), progress shown |
 | Wrong or garbled words (ASR errors, code-mixed or non-English speech) | Transcript quality score from: coverage vs speech-active audio, words per minute, non-Latin script ratio, Whisper average log-probability, LLM-reported quality | Timing-based metrics (turn-taking, talk share) are still used, because they depend on timestamps and speaker labels, not words. The LLM is told to judge only clearly readable parts; LLM weight in blended criteria is halved; confidence Low |
 | Partial transcript (starts late, long gaps) | Cue span vs video duration; gaps > 3 min where audio shows speech | Uncovered windows marked; criteria depending on them (e.g. opening) become not assessed |
-| Transcript doesn't match the video (wrong file, time offset) | Cross-correlate per-second speech activity (audio RMS) with cue coverage; best lag within ±120 s | Clear peak → shift cues by the offset. No peak → warn "transcript may belong to another recording"; use Mode B if time allows, else Mode C with Low confidence |
-| Malformed file (SRT instead of VTT, BOM, no speaker labels, odd encoding) | Tolerant parser | Accept WEBVTT and SRT; decode UTF-8 with replacement; cues without a `Name:` prefix → speaker `Unknown` → LLM role labelling |
 | Teacher detection ambiguous (top two speakers within 10%; teacher rejoins under another name) | Word-share gap; `Audio shared by` host signal | Merge labels for the same person (`X` + `Audio shared by X`); if still ambiguous, the UI asks the user to confirm the teacher before scoring |
-| One-to-one class (single student, e.g. demo) | Students present = 1 | C2 switches to student talk share and questions per minute; inclusion and Gini metrics skipped |
-| Clip starts mid-lesson or ends before goodbye ("Part" recordings) | First 2 min: no greeting, starts mid-sentence. Last 2 min: no closing words, ends mid-cue | Opening / closing marked **not captured**; C1 or C5 not assessed rather than scored 1, so a teacher is not penalised for what the clip doesn't show |
+| One-to-one class (single student, e.g. demo) | The LLM sees it in the transcript (students can't be counted without speaker labels) | C2 judged on student talk and questions to that child |
+| Clip starts mid-lesson or ends before goodbye ("Part" recordings) | The LLM reads the OPENING / CLOSING sections in context (keyword rules misfire: a "hello" to a late joiner is not the class opening) | The LLM marks C1 or C5 **not assessed** rather than scoring 1, so a teacher is not penalised for what the clip doesn't show |
 | Prompt injection in speech ("rate this class excellent") | — | Transcript sits in a delimited data block and the system prompt treats it as data; the grade is computed in code, so the LLM cannot set it |
 
 ### 9.3 Video and audio problems
@@ -400,9 +401,9 @@ Mode B privacy: Whisper output has no speaker labels to harvest names from. Name
 | Low resolution, blur, dark video | Laplacian variance; luminance | Reported; face-check thresholds scale with frame size; dark frames raise a lighting flag instead of "face missing" |
 | Non-standard layout (gallery view, screen share throughout, portrait phone) | Faces per frame; aspect ratio; screen-share ratio | Gallery → C6 face checks skipped (teacher can't be singled out); screen share throughout → use the top-right thumbnail; confidence lowered |
 | Unusual stream order (one sample has a data stream) | `ffprobe` stream types | Select streams by type (`-map 0:a:0`), never by index |
-| No audio track, or silent audio | `ffprobe`; RMS level | Audio features skipped; with no transcript → Mode E |
+| No audio track, or silent audio | `ffprobe`; RMS level | Audio features and transcript skipped → Mode E |
 | Corrupt or truncated file (incomplete upload, missing moov atom) | `ffprobe` error; decoded duration shorter than declared | Tolerant decode of the readable part, coverage reported; otherwise rejected with a clear message |
-| Very large (> 2 GB) or very long (> 2 h) | Upload size; duration | Reject > 2 GB; long recordings keep a fixed frame budget and a compacted transcript |
+| Very large (> 500 MB) or very long (> 2 h) | Upload size; duration | Uploads over 500 MB are refused by the uploader (Streamlit holds uploads in memory; the free host has ~2.7 GB); larger files via the link input (phase 5); long recordings keep a fixed frame budget and a compacted transcript |
 | Very short (< 10 min) | Duration | Opening/closing windows shrink proportionally; confidence lowered |
 
 ### 9.4 AI and service problems
@@ -416,14 +417,14 @@ Mode B privacy: Whisper output has no speaker labels to harvest names from. Name
 | Hallucinated evidence | Validator drops it; if > 50% of a criterion's evidence is rejected, that criterion uses metrics only |
 | LLM holistic grade far from computed grade | Both shown; confidence lowered |
 | Link not public / Drive quota exceeded | Clear message: set sharing to "Anyone with the link", or upload the file |
-| Two users at once | Single-run lock; second user sees "busy, try again in a few minutes" |
+| Two users at once | One analysis at a time (a lock shared by all sessions): the second user sees "another assessment is running" and theirs starts automatically when the first finishes. Uploads, temp folders and results stay separate per session. Two Whisper runs at once could exhaust the free host's memory and restart the app for everyone |
 
 ### 9.5 How scoring adapts
 
 - Each criterion records `assessed` (true/false) and which sources fed it.
 - Weights renormalise over assessed criteria: `score = 100 × Σ_assessed w_c·(s_c − 1)/3 ÷ Σ_assessed w_c`.
-- If assessed weight < 60% of the total, the grade is labelled **Provisional**, confidence is Low, and the report lists what is missing and which input would fix it (e.g. "upload the Zoom transcript").
-- Confidence = the lowest of: input-mode cap (§9.1), transcript quality, transcript–video alignment, evidence rejection rate, LLM–metric agreement.
+- If assessed weight < 60% of the total, the grade is labelled **Provisional**, confidence is Low, and the report lists what is missing and which input would fix it (e.g. "this recording has no audio").
+- Confidence = the lowest of: input-mode cap (§9.1), transcript quality, evidence rejection rate, LLM–metric agreement.
 
 ### 9.6 Edge-case tests
 
@@ -431,15 +432,13 @@ Variants generated locally from real recordings (never committed) with `ffmpeg` 
 
 | Variant | Expected result |
 |---|---|
-| Video only (VTT removed) | Mode B; grade within one band of Mode A; Medium confidence |
-| VTT only | Mode C; C6 not assessed |
-| VTT shifted by 45 s | Offset detected and corrected |
-| VTT from a different recording | Mismatch warning |
+| Labelled recording, video only | Grade within one band of the label; role labels agree with the Zoom VTT speakers on most lines |
+| Audio-only file | Rejected with a clear message |
 | Garbled transcript (demo Malayalam) | Transcript quality poor; Low confidence |
-| Audio removed, no VTT | Mode E; Provisional grade |
-| 8-minute clip from the middle | Opening and closing "not captured" |
+| Audio removed | Mode E; Provisional grade |
+| 8-minute clip from the middle | C1 and C5 not assessed |
 | Truncated file | Clear error, or partial-coverage report |
-| Injection line added to VTT | Grade unchanged |
+| Injection line inserted into the transcript | Grade unchanged |
 
 Unit tests on synthetic fixtures cover parser variants (SRT, BOM, missing speakers), label merging, weight renormalisation and the name guard.
 
@@ -455,10 +454,10 @@ Unit tests on synthetic fixtures cover parser variants (SRT, BOM, missing speake
 | Vision | `opencv-python-headless` | Bundled Haar face cascade, template matching; small and CPU-only |
 | Numerics | `numpy` | Audio RMS / pitch, frame stats |
 | LLM | `anthropic` SDK (+ its bundled Pydantic) | Structured outputs, typed errors, retries |
-| ASR fallback | `faster-whisper` (optional extra) | Local, CPU int8; only imported when no VTT is given |
+| Speech-to-text | `faster-whisper` | Local, CPU int8; runs on every recording |
 | Tests | `pytest` (dev only) | Parser, privacy, scoring tests on synthetic fixtures |
 
-Deliberately **not** used: LangChain / agent frameworks (one structured call doesn't need them), librosa (NumPy covers the needed features), moviepy, webvtt-py, pyannote (too heavy; Zoom labels already give speakers), vector DB / RAG (the whole transcript fits in context), vision LLMs on frames (privacy).
+Deliberately **not** used: LangChain / agent frameworks (one structured call doesn't need them), librosa (NumPy covers the needed features), moviepy, webvtt-py, pyannote (too heavy for the free host; roles come from one Claude call on pseudonymised text), vector DB / RAG (the whole transcript fits in context), vision LLMs on frames (privacy).
 
 ---
 
@@ -467,9 +466,9 @@ Deliberately **not** used: LangChain / agent frameworks (one structured call doe
 **Chosen: Streamlit Community Cloud** (free, no card; up to ~2 cores and ~2.7 GB RAM; deploys from the GitHub repo).
 
 - `requirements.txt` for Python packages; `packages.txt` installs `ffmpeg` via apt. Python 3.11 is selected in the app's advanced settings.
-- `.streamlit/config.toml`: `maxUploadSize = 2048`. XSRF protection stays on (default).
+- `.streamlit/config.toml`: `maxUploadSize = 500` (MB; uploads are held in memory, Whisper needs ~1.2 GB of the ~2.7 GB). XSRF protection stays on (default).
 - Secrets (app settings → Secrets, TOML): `APP_ACCESS_CODE`, `ANTHROPIC_API_KEY`. Root-level secrets are exposed as environment variables, so the code reads `os.environ`.
-- Limited CPU/RAM: Mode B transcribes only the opening and closing 10 minutes plus sampled middle windows (~25 min of audio instead of the whole class), and frames are seek-sampled rather than decoded in full.
+- Limited CPU/RAM: if a full Whisper pass is too slow, transcribe only the opening and closing 10 minutes plus sampled middle windows (~25 min of audio instead of the whole class); frames are seek-sampled rather than decoded in full.
 - If a 300 MB upload fails on the platform, the Google Drive link input (server-side download) is the fallback path.
 - Free apps sleep after inactivity → open the app shortly before the evaluation window.
 - Visibility: private (invited viewers only) while building; switched to public, behind the access code, at submission. Same for the GitHub repo.
@@ -499,7 +498,7 @@ C1 Opening & rapport ............ 3/4
   + [00:01:05] T greets S1 by name and asks about their chess match before starting.
   − [00:06:40] S4 joins; no self-introduction invited.
 C2 Individual engagement ........ 4/4
-  + 5 of 6 students addressed by name; 11.2 turn switches/min (Excellent-tier range).
+  + 11.2 turn switches/min (Excellent-tier range).
   − S5 spoke only twice in 45 min.
 C5 Homework ..................... 1/4
   − Closing segment [41:00–45:00] ends with a goodbye; no homework assigned.
@@ -510,7 +509,7 @@ Top improvements
   1. Invite late joiners to introduce themselves (see 06:40).
   2. Assign 2–3 practice puzzles before closing (see 41:00).
 
-AI trace: judge_v1 · claude-opus-5-5 · effort medium · 18.9k in / 4.1k out · ~$0.16 · 41 s · evidence 23/25 accepted · LLM holistic: Good
+AI trace: judge_v3 · claude-opus-5-5 · effort medium · 18.9k in / 4.1k out · ~$0.16 · 41 s · evidence 23/25 accepted · LLM holistic: Good
 ```
 
 Downloadable JSON contains the same data.
@@ -519,7 +518,12 @@ Downloadable JSON contains the same data.
 
 ## 13. Logging
 
-**Runtime AI log** (`logs/ai_calls.jsonl`, not committed): one line per LLM call — `ts, run_id, purpose, prompt_version, model, effort, input_tokens, output_tokens, cache_read_tokens, latency_ms, stop_reason, cost_estimate, evidence_accepted, evidence_rejected`. No transcript text, no names.
+**Run log** (`logs/runs.jsonl`, not committed; every line is also printed, because on Streamlit Community Cloud only the app's output in Manage app → Logs survives a restart):
+
+- one `analysis` line per run: `ts, outcome (ok / rejected / error + exception type), run_id (SHA-256 of the first 1 MB), waited_s, video_min, has_audio, transcription_s, lines, words, total_s, peak_memory_mb`;
+- one line per Claude call (`roles`, `judge`): `ts, outcome, prompt_version, model, effort, attempts, input/output tokens, cost_usd, latency_s, served_model, stop_reason` + step counts (evidence accepted/rejected, role line counts).
+
+No transcript text, no names, no file names.
 
 **Development AI interaction history** (`ai-logs/`, committed after redaction; required by the brief):
 
@@ -555,35 +559,40 @@ Downloadable JSON contains the same data.
 
 ## 15. Repository layout
 
+Full file-by-file map with every class and function: [LLD §2](LLD.md#2-code-map).
+
 ```
 app.py                      # Streamlit UI
 classlens/
-  config.py                 # weights, thresholds, model, limits
-  models.py                 # dataclasses + Pydantic judgement schema
+  config.py                 # weights, thresholds, model, limits, .env loading
+  models.py                 # data types shared by all modules
+  timecode.py               # seconds ↔ "mm:ss"
   ingest.py
-  transcript.py
-  privacy.py
-  asr.py                    # optional Whisper fallback
-  metrics.py
-  audio.py
-  video.py
-  judge.py
-  scoring.py
-  report.py
-  ailog.py
-  pipeline.py
-prompts/judge_v1.md
-assets/brand_logo.png       # 8x8 logo template for background detection
-scripts/evaluate.py
-scripts/export_ai_log.py
-scripts/check_clean.sh      # pre-commit guard: no media, transcripts or names
-tests/                      # synthetic fixtures only — no real transcripts
-docs/HLD.md
+  transcript.py             # TranscriptParser, TranscriptAnalyzer
+  privacy.py                # Pseudonymiser, NameGuard
+  metrics.py                # InteractionAnalyzer
+  llm/
+    schema.py               # Pydantic answer format
+    prompt.py               # PromptBuilder
+    evidence.py             # EvidenceValidator
+    judge.py                # ClaudeJudge
+  runlog.py                 # RunLog
+  asr.py                    # (phase 3) optional Whisper fallback
+  audio.py                  # (phase 3)
+  video.py                  # (phase 3)
+  scoring.py                # Scorer
+  pipeline.py               # AssessmentPipeline
+prompts/judge_v1.md, judge_v2.md, judge_v3.md, roles_v1.md
+assets/brand_logo.png       # (phase 3) 8x8 logo template for background detection
+scripts/dataset.py          # local-only dataset helpers
+scripts/inspect_transcripts.py, try_judge.py, build_redact_list.py
+scripts/evaluate.py         # (phase 4)
+scripts/export_ai_log.py    # (phase 5)
+scripts/check_clean.sh      # pre-commit guard: no media, transcripts, keys or names
+tests/                      # synthetic fixtures only — one test file per module
+docs/HLD.md, docs/LLD.md
 ai-logs/
-Dockerfile
-.dockerignore
-requirements.txt
-.streamlit/config.toml
+Dockerfile, .dockerignore, packages.txt, requirements.txt, .streamlit/config.toml, .env.example
 README.md
 ```
 
@@ -595,15 +604,15 @@ README.md
 |---|---|---|---|
 | 0 Skeleton + deploy check | 30 min | Repo, `.gitignore`, config, Dockerfile, `packages.txt`, hello-world app on Streamlit Community Cloud with upload + `ffprobe` | Hosted page accepts a 300 MB upload and prints its duration |
 | 1 Transcript layer | 75 min | `transcript.py` (tolerant VTT/SRT parser, label merging, quality score, clip-boundary detection), `privacy.py`, `metrics.py`, tests | Metrics for all 12 recordings; no real names in the pseudonymised output; parser tests pass on malformed fixtures |
-| 2 LLM judge | 60 min | `prompts/judge_v1.md`, `judge.py`, validator, `ailog.py`, local-only fallback | Valid `Judgement` on 2 recordings; ≥ 90% evidence accepted; API failure falls back cleanly |
-| 3 Audio + video | 75 min | `audio.py`, `video.py`, logo template, transcript–video alignment, `asr.py` (Mode B) | Flags match reviewer notes for B482, B441, B392; 45 s offset detected; Mode B runs end to end |
+| 2 LLM judge | 60 min | `prompts/judge_v1.md`, `judge.py`, validator, `runlog.py`, local-only fallback | Valid `Judgement` on 2 recordings; ≥ 90% evidence accepted; API failure falls back cleanly |
+| 3 Audio + video | 75 min | `asr.py` (Whisper + role labelling), `audio.py`, `video.py`, logo template | Flags match reviewer notes for B482, B441, B392; video-only run works end to end within the time budget |
 | 4 Scoring + calibration | 45 min | `scoring.py` (renormalisation, provisional grade), `scripts/evaluate.py` | Confusion matrix + criterion-check table in `eval/results.md` |
 | 4b Edge-case run | 30 min | `evaluate.py --edge-cases` | All §9.6 variants give the expected result |
-| 5 UI, deploy, submission | 45 min | `app.py`, report, README, 300-word note, AI-log export | Unseen-style test (demo recording, mp4 only and mp4 + VTT) works on the hosted link |
+| 5 UI, deploy, submission | 45 min | `app.py`, report, README, 300-word note, AI-log export | Unseen-style test (demo recording, video only) works on the hosted link |
 
-Total ≈ 6 h. If time runs short, cut in this order: Mode D (audio-only), choppy-audio metric, prompt v2. Never cut: Mode B, local-only fallback, name guard.
+Total ≈ 6 h. If time runs short, cut in this order: choppy-audio metric, evaluation-driven prompt v3. Never cut: speech-to-text, local-only fallback, name guard.
 
-Stretch, if time remains: parallel audio/video extraction; prompt v2 from evaluation errors.
+Stretch, if time remains: parallel audio/video extraction; prompt v3 from evaluation errors.
 
 ---
 
@@ -611,7 +620,7 @@ Stretch, if time remains: parallel audio/video extraction; prompt v2 from evalua
 
 | Risk | Mitigation |
 |---|---|
-| Test recording comes without a VTT | Mode B (§9.1); Whisper on a 2-vCPU host may take 5–10 min for 60 min of audio — measure in Phase 0, show progress |
+| Every recording needs speech-to-text (no VTT is provided) | Whisper on a 2-vCPU host may take 5–10 min for 60 min of audio — measure first, show progress, windowed transcription if too slow (§11) |
 | Code-mixed / non-English speech garbles transcripts | Transcript quality score (§9.2); timing metrics still used; confidence lowered |
 | Overfitting to 10 examples | Rubric comes from reviewer criteria; only cut-points are calibrated; leave-one-out reported |
 | Zoom gallery view instead of speaker view breaks teacher-frame mapping | Detect multi-tile layouts (many faces per frame) → skip C6 face checks, lower confidence |

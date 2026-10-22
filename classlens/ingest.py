@@ -1,94 +1,86 @@
-"""Input handling: save uploads to a temp dir, read media metadata, pick the input mode."""
+"""Input handling: save the uploaded video to a temp dir and read its metadata (LLD §5.3)."""
 
+import hashlib
 import json
 import shutil
 import subprocess
-from dataclasses import dataclass
 from pathlib import Path
-from typing import BinaryIO
 
 from classlens import config
+from classlens.models import MediaInfo
 
-# Input modes (HLD §9.1). The mode decides which checks can run and caps confidence.
-MODES = {
-    "A": "Full analysis (recording + transcript)",
-    "B": "Recording only: transcript will be generated on the server",
-    "C": "Transcript only: camera and video checks are not possible",
-    "D": "Audio only: transcript will be generated on the server",
-    "E": "Video without audio or transcript: visual checks only, grade is provisional",
-}
+COPY_CHUNK_BYTES = 8 * 1024 * 1024
+RUN_ID_BYTES = 1024 * 1024  # how much of the file the run id is computed from
 
 
 class IngestError(Exception):
     """Problem with the user's input. The message is shown to the user as-is."""
 
 
-@dataclass(frozen=True)
-class MediaInfo:
-    duration_s: float
-    has_video: bool
-    has_audio: bool
-    width: int | None = None
-    height: int | None = None
-
-
-def save_upload(upload: BinaryIO, original_name: str, workdir: Path) -> Path:
-    """Stream an upload to disk under a generic name (original filenames can contain names)."""
+def save_upload(upload, original_name: str, workdir: Path) -> Path:
+    """Stream an upload (any file object opened in binary mode) to disk under a generic name
+    (original filenames can contain names)."""
     path = workdir / f"input{Path(original_name).suffix.lower()}"
     with path.open("wb") as out:
-        shutil.copyfileobj(upload, out, length=8 * 1024 * 1024)
+        shutil.copyfileobj(upload, out, length=COPY_CHUNK_BYTES)
     return path
 
 
+def run_id(path: Path) -> str:
+    """Short SHA-256 of the file's first 1 MB: tells runs of the same video apart in the log
+    without storing its name."""
+    with path.open("rb") as file:
+        return hashlib.sha256(file.read(RUN_ID_BYTES)).hexdigest()[:12]
+
+
 def probe(path: Path) -> MediaInfo:
-    """Read duration and stream types with ffprobe. Streams are matched by type, never by index."""
-    cmd = [
+    """Read duration, video size and whether there is audio, with ffprobe."""
+    data = _run_ffprobe(path)
+    streams = data.get("streams", [])
+    video = _real_video_stream(streams)
+    has_audio = any(stream.get("codec_type") == "audio" for stream in streams)
+    duration_s = _duration(data)
+
+    if duration_s <= 0:
+        raise IngestError("Could not determine the length of this recording.")
+    if video is None:
+        raise IngestError("This file has no video. Upload the class recording (mp4, mov, mkv or webm).")
+    return MediaInfo(
+        duration_s=duration_s,
+        has_audio=has_audio,
+        width=video.get("width"),
+        height=video.get("height"),
+    )
+
+
+def _run_ffprobe(path: Path) -> dict:
+    command = [
         "ffprobe", "-v", "error", "-print_format", "json",
         "-show_format", "-show_streams", str(path),
     ]
     try:
         result = subprocess.run(
-            cmd, capture_output=True, text=True, check=True, timeout=config.FFPROBE_TIMEOUT_S
+            command, capture_output=True, text=True, check=True, timeout=config.FFPROBE_TIMEOUT_S
         )
     except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as err:
         raise IngestError(
             "This file could not be read as audio or video. It may be corrupt or incomplete."
         ) from err
-
-    data = json.loads(result.stdout or "{}")
-    streams = data.get("streams", [])
-    # Cover art in audio files shows up as a video stream; it is not real video.
-    video = next(
-        (s for s in streams
-         if s.get("codec_type") == "video" and not s.get("disposition", {}).get("attached_pic")),
-        None,
-    )
-    has_audio = any(s.get("codec_type") == "audio" for s in streams)
-
-    durations = [data.get("format", {}).get("duration")] + [s.get("duration") for s in streams]
-    duration_s = max((float(d) for d in durations if d not in (None, "N/A")), default=0.0)
-    if duration_s <= 0:
-        raise IngestError("Could not determine the length of this recording.")
-    if video is None and not has_audio:
-        raise IngestError("This file has no video or audio stream.")
-
-    return MediaInfo(
-        duration_s=duration_s,
-        has_video=video is not None,
-        has_audio=has_audio,
-        width=video.get("width") if video else None,
-        height=video.get("height") if video else None,
-    )
+    return json.loads(result.stdout or "{}")
 
 
-def input_mode(media: MediaInfo | None, has_transcript: bool) -> str:
-    """Pick the input mode from what was provided (HLD §9.1)."""
-    if media is None:
-        if has_transcript:
-            return "C"
-        raise IngestError("Upload a recording, a transcript, or both.")
-    if media.has_video:
-        if has_transcript:
-            return "A"
-        return "B" if media.has_audio else "E"
-    return "C" if has_transcript else "D"
+def _real_video_stream(streams: list[dict]) -> dict | None:
+    """First video stream that is not cover art (audio files show cover art as a video stream)."""
+    for stream in streams:
+        is_cover_art = stream.get("disposition", {}).get("attached_pic")
+        if stream.get("codec_type") == "video" and not is_cover_art:
+            return stream
+    return None
+
+
+def _duration(data: dict) -> float:
+    """Longest duration reported by the container or any stream (some files only report one)."""
+    reported = [data.get("format", {}).get("duration")]
+    reported += [stream.get("duration") for stream in data.get("streams", [])]
+    valid = [float(value) for value in reported if value not in (None, "N/A")]
+    return max(valid, default=0.0)

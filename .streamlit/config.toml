@@ -1,6 +1,8 @@
 [server]
 headless = true
-maxUploadSize = 2048  # MB
+# MB. Streamlit holds an upload in memory; the free host has ~2.7 GB and Whisper needs ~1.2 GB.
+# Sample classes are 54–340 MB.
+maxUploadSize = 500
 
 [browser]
 gatherUsageStats = false

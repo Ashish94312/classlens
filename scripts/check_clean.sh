@@ -7,10 +7,17 @@ staged=$(git diff --cached --name-only --diff-filter=ACM)
 [ -z "$staged" ] && exit 0
 status=0
 
-blocked=$(grep -Ei '\.(mp4|mov|mkv|webm|mp3|m4a|wav|vtt|srt|pdf)$' <<<"$staged" || true)
+blocked=$(grep -Ei '\.(mp4|mov|mkv|webm|mp3|m4a|wav|vtt|srt|pdf)$|(^|/)\.env$|secrets\.toml$' <<<"$staged" || true)
 if [ -n "$blocked" ]; then
-  echo "Blocked: media, transcript or PDF files staged:" >&2
+  echo "Blocked: media, transcript, PDF or secrets files staged:" >&2
   echo "$blocked" >&2
+  status=1
+fi
+
+keys=$(git grep --cached -l -E 'sk-ant-[A-Za-z0-9_-]{10,}' -- $staged || true)
+if [ -n "$keys" ]; then
+  echo "Blocked: API key found in staged files:" >&2
+  echo "$keys" >&2
   status=1
 fi
 

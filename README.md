@@ -4,6 +4,12 @@ Assesses the quality of a recorded online class and grades it **Poor / Average /
 
 Design: [docs/HLD.md](docs/HLD.md) · AI interaction history: [ai-logs/](ai-logs/)
 
+## How it works
+
+Upload a class video (mp4, mov, mkv or webm, up to 500 MB). On the server: speech-to-text with a local Whisper model → names replaced with codes (T, S, N1…) → Claude labels each line teacher / student / shared media → interaction metrics → Claude scores a 7-criterion rubric with timestamped evidence → code turns the scores into a 0–100 score and a grade. Video and audio never leave the server; only the de-identified transcript goes to the Claude API.
+
+A 44-minute class takes about 2.5 minutes on a laptop (Whisper about 2 min, Claude about 35 s) and about $0.15 in API calls. One analysis runs at a time; others wait their turn.
+
 ## Run locally
 
 Requires Python 3.11 and `ffmpeg`.
@@ -11,27 +17,30 @@ Requires Python 3.11 and `ffmpeg`.
 ```bash
 python -m venv .venv
 .venv/bin/pip install -r requirements-dev.txt
+cp .env.example .env      # then fill in ANTHROPIC_API_KEY
 .venv/bin/streamlit run app.py
 ```
 
-Optional environment variables:
+The first analysis downloads the Whisper model (about 150 MB) once.
 
 | Variable | Purpose |
 |---|---|
+| `ANTHROPIC_API_KEY` | Claude API key. Without it the app stops after speech-to-text and says why |
 | `APP_ACCESS_CODE` | Access code required to use the app (unset = no gate, for local development) |
-| `ANTHROPIC_API_KEY` | Claude API key (unset = local-only mode) |
 
 ## Deploy (Streamlit Community Cloud)
 
-1. At [share.streamlit.io](https://share.streamlit.io), create an app from this repo, branch `main`, main file `app.py`.
-2. Advanced settings: Python 3.11; Secrets:
+1. Push the repository to GitHub (it can stay private).
+2. At [share.streamlit.io](https://share.streamlit.io): **Create app** → *Deploy a public app from GitHub* → repository, branch `main`, main file `app.py`.
+3. **Advanced settings**: Python 3.11; Secrets:
    ```toml
    APP_ACCESS_CODE = "choose-a-code"
    ANTHROPIC_API_KEY = "sk-ant-..."
    ```
-3. `packages.txt` installs `ffmpeg`; `requirements.txt` installs the Python packages.
+4. Deploy. `packages.txt` installs `ffmpeg`, `requirements.txt` the Python packages (first build takes a few minutes).
+5. Run one sample class. **Manage app → Logs** shows one `"purpose": "analysis"` line per run with the real timings (`transcription_s`, `total_s`) and memory (`peak_memory_mb`).
 
-A `Dockerfile` is included for running the same app on any container host.
+Free apps sleep after a period without visitors; open the link shortly before it is tested. A `Dockerfile` is included to run the same app on any container host.
 
 ## Tests
 
